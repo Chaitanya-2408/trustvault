@@ -1,4 +1,6 @@
 
+from datetime import datetime
+
 from flask_login import UserMixin
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -21,6 +23,64 @@ class User(UserMixin, db.Model):
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
+
+
+class Document(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    category = db.Column(db.String(100), nullable=False, default="General")
+    description = db.Column(db.Text, nullable=False, default="")
+    owner_id = db.Column(
+        db.Integer,
+        db.ForeignKey("user.id"),
+        nullable=False,
+        index=True,
+    )
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    owner = db.relationship("User", backref="owned_documents")
+
+
+class DocumentPermission(db.Model):
+    __table_args__ = (
+        db.UniqueConstraint(
+            "document_id",
+            "user_id",
+            name="uq_document_permission_user",
+        ),
+        db.CheckConstraint(
+            "permission_level IN ('READ', 'EDIT')",
+            name="ck_document_permission_level",
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(
+        db.Integer,
+        db.ForeignKey("document.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    permission_level = db.Column(db.String(10), nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    document = db.relationship(
+        "Document",
+        backref=db.backref("permissions", cascade="all, delete-orphan"),
+    )
+    user = db.relationship("User", backref="document_permissions")
 
 
 @login_manager.user_loader

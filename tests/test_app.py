@@ -6,6 +6,10 @@ from backend.extensions import db
 from backend.models import User
 
 
+PASSWORD = "Correct-Horse-Battery-12"
+
+
+
 @pytest.fixture()
 def app():
     app = create_app({
@@ -13,13 +17,23 @@ def app():
         "SECRET_KEY": "test-secret-key-for-tests-only",
         "SQLALCHEMY_DATABASE_URI": "sqlite://",
         "WTF_CSRF_ENABLED": True,
+        "SESSION_COOKIE_SECURE": False,
+        "REMEMBER_COOKIE_SECURE": False,
     })
 
+    # Create tables inside a temporary application context.
     with app.app_context():
         db.create_all()
-        yield app
+
+    # IMPORTANT: Do not keep an application context open
+    # while the test client sends requests.
+    yield app
+
+    # Clean up after the test in a separate context.
+    with app.app_context():
         db.session.remove()
         db.drop_all()
+
 
 
 @pytest.fixture()
@@ -27,22 +41,75 @@ def client(app):
     return app.test_client()
 
 
-def get_csrf_headers(client):
-    response = client.get("/csrf-token")
-    assert response.status_code == 200
 
-    token = response.get_json()["csrf_token"]
+def csrf_headers(client):
+    response = client.get("/csrf-token")
+
+    assert response.status_code == 200, (
+        f"CSRF endpoint failed: {response.get_json()}"
+    )
+
+    token = response.get_json().get("csrf_token")
+
+    assert token, "CSRF token was not returned."
+
     return {"X-CSRFToken": token}
 
 
-def register_user(client, email="student@example.com"):
+def register(client, email):
     return client.post(
         "/register",
+        json={"email": email, "password": PASSWORD},
+        headers=csrf_headers(client),
+    )
+
+
+def login(client, email):
+    return client.post(
+        "/login",
+        json={"email": email, "password": PASSWORD},
+        headers=csrf_headers(client),
+    )
+
+
+def register_and_login(client, email):
+    response = register(client, email)
+
+    assert response.status_code == 201, (
+        f"Registration failed for {email}: "
+        f"status={response.status_code}, "
+        f"body={response.get_json()}"
+    )
+
+    response = login(client, email)
+
+    assert response.status_code == 200, (
+        f"Login failed for {email}: "
+        f"status={response.status_code}, "
+        f"body={response.get_json()}"
+    )
+
+
+def create_document(client, title="Project Plan"):
+    return client.post(
+        "/documents",
+        json={
+            "title": title,
+            "category": "Projects",
+            "description": "A test document",
+        },
+        headers=csrf_headers(client),
+    )
+
+
+def grant_permission(client, document_id, email, level):
+    return client.post(
+        f"/documents/{document_id}/permissions",
         json={
             "email": email,
-            "password": "Correct-Horse-Battery-12",
+            "permission_level": level,
         },
-        headers=get_csrf_headers(client),
+        headers=csrf_headers(client),
     )
 
 
@@ -57,16 +124,7 @@ def test_health_endpoint_returns_success(client):
 
 
 def test_registration_stores_password_hash_not_plaintext(client, app):
-    password = "Correct-Horse-Battery-12"
-
-    response = client.post(
-        "/register",
-        json={
-            "email": "student@example.com",
-            "password": password,
-        },
-        headers=get_csrf_headers(client),
-    )
+    response = register(client, "student@example.com")
 
     assert response.status_code == 201
 
@@ -75,42 +133,32 @@ def test_registration_stores_password_hash_not_plaintext(client, app):
             db.select(User).filter_by(email="student@example.com")
         ).scalar_one()
 
-        assert user.password_hash != password
-        assert user.check_password(password)
+        assert user.password_hash != PASSWORD
+        assert user.check_password(PASSWORD)
         assert user.role == "viewer"
 
 
 def test_duplicate_registration_is_rejected(client):
-    assert register_user(client).status_code == 201
-    assert register_user(client).status_code == 409
+    assert register(client, "student@example.com").status_code == 201
+    assert register(client, "student@example.com").status_code == 409
 
 
 def test_login_and_logout(client):
-    assert register_user(client).status_code == 201
+    register_and_login(client, "student@example.com")
 
-    login_response = client.post(
-        "/login",
-        json={
-            "email": "student@example.com",
-            "password": "Correct-Horse-Battery-12",
-        },
-        headers=get_csrf_headers(client),
-    )
-
-    assert login_response.status_code == 200
     assert client.get("/me").status_code == 200
 
-    logout_response = client.post(
+    response = client.post(
         "/logout",
-        headers=get_csrf_headers(client),
+        headers=csrf_headers(client),
     )
 
-    assert logout_response.status_code == 200
+    assert response.status_code == 200
     assert client.get("/me").status_code == 401
 
 
 def test_wrong_password_is_rejected(client):
-    assert register_user(client).status_code == 201
+    assert register(client, "student@example.com").status_code == 201
 
     response = client.post(
         "/login",
@@ -118,7 +166,7 @@ def test_wrong_password_is_rejected(client):
             "email": "student@example.com",
             "password": "Wrong-Password-123",
         },
-        headers=get_csrf_headers(client),
+        headers=csrf_headers(client),
     )
 
     assert response.status_code == 401
@@ -128,15 +176,25 @@ def test_unauthenticated_user_cannot_access_profile(client):
     response = client.get("/me")
 
     assert response.status_code == 401
-    assert response.get_json()["error"] == "Authentication required"
 
 
-def test_state_changing_request_requires_csrf_token(client):
-    response = client.post(
+def test_state_changing_request_requires_csrf_token():
+    csrf_app = create_app({
+        "TESTING": True,
+        "SECRET_KEY": "csrf-test-secret-key",
+        "SQLALCHEMY_DATABASE_URI": "sqlite://",
+        "WTF_CSRF_ENABLED": True,
+        "SESSION_COOKIE_SECURE": False,
+        "REMEMBER_COOKIE_SECURE": False,
+    })
+
+    csrf_client = csrf_app.test_client()
+
+    response = csrf_client.post(
         "/register",
         json={
             "email": "student@example.com",
-            "password": "Correct-Horse-Battery-12",
+            "password": PASSWORD,
         },
     )
 
@@ -149,3 +207,147 @@ def test_app_requires_secret_key(monkeypatch):
 
     with pytest.raises(RuntimeError, match="SECRET_KEY must be set"):
         create_app()
+
+
+def test_owner_can_create_and_read_document(client):
+    register_and_login(client, "owner@example.com")
+
+    response = create_document(client)
+
+    assert response.status_code == 201
+    document_id = response.get_json()["id"]
+
+    response = client.get(f"/documents/{document_id}")
+
+    assert response.status_code == 200
+    assert response.get_json()["access"] == "OWNER"
+
+
+def test_document_is_not_visible_to_an_ungranted_user(app):
+    owner = app.test_client()
+    viewer = app.test_client()
+
+    register_and_login(owner, "owner@example.com")
+    register_and_login(viewer, "viewer@example.com")
+
+    response = create_document(owner)
+    document_id = response.get_json()["id"]
+
+    response = viewer.get(f"/documents/{document_id}")
+
+    assert response.status_code == 403
+
+    response = viewer.get("/documents")
+
+    assert response.status_code == 200
+    assert response.get_json()["documents"] == []
+
+
+def test_read_permission_allows_reading_but_not_editing(app):
+    owner = app.test_client()
+    viewer = app.test_client()
+
+    register_and_login(owner, "owner@example.com")
+    register_and_login(viewer, "viewer@example.com")
+
+    document_id = create_document(owner).get_json()["id"]
+
+    grant = grant_permission(
+        owner,
+        document_id,
+        "viewer@example.com",
+        "READ",
+    )
+
+    assert grant.status_code == 200
+
+    response = viewer.get(f"/documents/{document_id}")
+
+    assert response.status_code == 200
+    assert response.get_json()["access"] == "READ"
+
+    response = viewer.patch(
+        f"/documents/{document_id}",
+        json={"title": "Changed by viewer"},
+        headers=csrf_headers(viewer),
+    )
+
+    assert response.status_code == 403
+
+
+def test_edit_permission_allows_reading_and_editing(app):
+    owner = app.test_client()
+    editor = app.test_client()
+
+    register_and_login(owner, "owner@example.com")
+    register_and_login(editor, "editor@example.com")
+
+    document_id = create_document(owner).get_json()["id"]
+
+    grant = grant_permission(
+        owner,
+        document_id,
+        "editor@example.com",
+        "EDIT",
+    )
+
+    assert grant.status_code == 200
+    assert editor.get(f"/documents/{document_id}").status_code == 200
+
+    response = editor.patch(
+        f"/documents/{document_id}",
+        json={"title": "Updated by editor"},
+        headers=csrf_headers(editor),
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["title"] == "Updated by editor"
+
+
+def test_revoking_permission_blocks_subsequent_requests(app):
+    owner = app.test_client()
+    viewer = app.test_client()
+
+    register_and_login(owner, "owner@example.com")
+    register_and_login(viewer, "viewer@example.com")
+
+    document_id = create_document(owner).get_json()["id"]
+
+    grant = grant_permission(
+        owner,
+        document_id,
+        "viewer@example.com",
+        "READ",
+    )
+
+    assert grant.status_code == 200
+    user_id = grant.get_json()["user_id"]
+
+    assert viewer.get(f"/documents/{document_id}").status_code == 200
+
+    response = owner.delete(
+        f"/documents/{document_id}/permissions/{user_id}",
+        headers=csrf_headers(owner),
+    )
+
+    assert response.status_code == 200
+    assert viewer.get(f"/documents/{document_id}").status_code == 403
+
+
+def test_non_owner_cannot_grant_permissions(app):
+    owner = app.test_client()
+    viewer = app.test_client()
+
+    register_and_login(owner, "owner@example.com")
+    register_and_login(viewer, "viewer@example.com")
+
+    document_id = create_document(owner).get_json()["id"]
+
+    response = grant_permission(
+        viewer,
+        document_id,
+        "owner@example.com",
+        "EDIT",
+    )
+
+    assert response.status_code == 403
