@@ -1,0 +1,16 @@
+
+.env
+.env.*
+!.env.example
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+instance/
+private_uploads/
+node_modules/
+dist/
