@@ -33,3 +33,17 @@
 - **Testing:** The final test run reported 8 passed.
 - **My reflection:** Testing the security changes helped me understand that authentication features need automated checks, not just a successful login in the browser.
 - **Commit Id:**  `3e58941` 
+
+
+### Entry 4 — Document ownership and permission testing
+**Date:** 22 October 2026
+
+**Prompt:** Help me implement document ownership, per-user READ and EDIT permissions, permission revocation, and tests that prevent unauthorized document access.
+
+**Work completed:** Added document metadata and permission models, owner-controlled permission grants and revocation, and authorization checks for reading and editing documents. Updated the test fixture to correctly isolate Flask application contexts and CSRF sessions.
+
+**Security considerations:** Unapproved users cannot access documents, READ permission does not allow editing, EDIT permission allows editing, and revoked permissions block subsequent requests. CSRF protection remains enabled in the application and test suite.
+
+**Validation:** Ran `python -m pytest -q`. Result: 14 passed in 2.16 seconds.
+
+**Commit:** `4f5c087` — feat: add document permissions and secure test coverage
