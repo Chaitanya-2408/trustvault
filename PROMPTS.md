@@ -20,4 +20,4 @@
 - **What I changed:** I configured Flask-Login to return a JSON error response with HTTP status `401` when authentication is required.
 - **What I learned:** I learned the difference between an HTTP redirect and an unauthorized response, and why JSON APIs should return appropriate HTTP status codes.
 - **Testing:** Initially, four tests passed and two failed. Record the final result after rerunning pytest.
-- **Commit:** To be recorded after the fix is committed.
+- **Commit:** dfd6bc4 - return unauthorized responses for protected routes
