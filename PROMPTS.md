@@ -62,3 +62,18 @@
 
 **Commit:** `cc7347d `
 
+
+
+### Entry 6 — Audit logging integration
+
+**Date:** 22 October 2026
+
+**Prompt:** Help me integrate the tamper-evident audit log into the TrustVault Flask API and test the security events.
+
+**Work completed:** Integrated audit events into document creation, document updates, denied document reads and edits, permission grants, permission changes, permission revocations, and denied permission-grant attempts. Added integration tests for successful and denied operations and audit-chain integrity.
+
+**Security considerations:** Successful document and permission changes are recorded in the same database transaction as their audit events. The hash chain detects event modification, but does not guarantee immutability if an attacker can rewrite the entire database and recompute the chain.
+
+**Validation:** `python -m pytest -q` — 20 tests passed.  
+**Commit:** `861cedf`
+
