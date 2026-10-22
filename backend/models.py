@@ -89,3 +89,43 @@ def load_user(user_id):
         return db.session.get(User, int(user_id))
     except (TypeError, ValueError):
         return None
+
+
+
+class AuditLog(db.Model):
+    """Stores security events in a tamper-evident hash chain."""
+
+    __tablename__ = "audit_log"
+
+    __table_args__ = (
+        db.CheckConstraint(
+            "outcome IN ('SUCCESS', 'DENIED')",
+            name="ck_audit_log_outcome",
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    # Snapshots preserve historical references even if users/documents
+    # are eventually removed.
+    actor_user_id = db.Column(db.Integer, nullable=True, index=True)
+    actor_email = db.Column(db.String(255), nullable=True)
+
+    action = db.Column(db.String(80), nullable=False, index=True)
+    outcome = db.Column(db.String(20), nullable=False, index=True)
+
+    document_id = db.Column(db.Integer, nullable=True, index=True)
+    target_user_id = db.Column(db.Integer, nullable=True)
+
+    # Store safe metadata, never document contents, passwords, or tokens.
+    details = db.Column(db.JSON, nullable=False, default=dict)
+
+    created_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        index=True,
+    )
+
+    previous_hash = db.Column(db.String(64), nullable=False)
+    event_hash = db.Column(db.String(64), nullable=False, unique=True)

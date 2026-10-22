@@ -3,7 +3,8 @@ import pytest
 
 from backend.app import create_app
 from backend.extensions import db
-from backend.models import User
+from backend.audit import log_audit_event, verify_audit_chain
+from backend.models import AuditLog, User
 
 
 PASSWORD = "Correct-Horse-Battery-12"
@@ -351,3 +352,51 @@ def test_non_owner_cannot_grant_permissions(app):
     )
 
     assert response.status_code == 403
+
+
+
+def test_audit_events_form_a_valid_hash_chain(app):
+    with app.app_context():
+        first = log_audit_event(
+            action="DOCUMENT_CREATED",
+            outcome="SUCCESS",
+            actor_email="owner@example.com",
+            document_id=1,
+            details={"category": "Projects"},
+        )
+
+        second = log_audit_event(
+            action="PERMISSION_GRANTED",
+            outcome="SUCCESS",
+            actor_email="owner@example.com",
+            document_id=1,
+            target_user_id=2,
+            details={"permission_level": "READ"},
+        )
+
+        assert first.previous_hash == "0" * 64
+        assert second.previous_hash == first.event_hash
+        assert verify_audit_chain() is True
+
+
+def test_audit_chain_detects_modified_event(app):
+    with app.app_context():
+        log_audit_event(
+            action="DOCUMENT_CREATED",
+            outcome="SUCCESS",
+            actor_email="owner@example.com",
+            document_id=1,
+            details={"category": "Projects"},
+        )
+
+        assert verify_audit_chain() is True
+
+        event = db.session.execute(
+            db.select(AuditLog).order_by(AuditLog.id.asc())
+        ).scalars().first()
+
+        event.details = {"category": "Tampered"}
+        db.session.commit()
+
+        assert verify_audit_chain() is False
+
