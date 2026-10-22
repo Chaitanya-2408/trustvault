@@ -47,3 +47,18 @@
 **Validation:** Ran `python -m pytest -q`. Result: 14 passed in 2.16 seconds.
 
 **Commit:** `4f5c087` — feat: add document permissions and secure test coverage
+
+
+### Entry 5 — Tamper-evident audit log foundation
+**Date:** 22 October 2026
+
+**Prompt:** Help me implement an audit log with SHA-256 hash chaining and automated integrity tests for TrustVault.
+
+**Work completed:** Added the AuditLog model, an audit-event recording helper, canonical event serialization, SHA-256 event hashing, and a chain-verification function.
+
+**Security considerations:** Audit events retain historical actor and document identifiers without foreign-key deletion cascades. The hash chain detects event modification, but it is not immutable against an attacker who can rewrite the entire database and recompute the chain.
+
+**Validation:** Ran `python -m pytest -q`. Result: 16 passed in 2.22 seconds.
+
+**Commit:** `cc7347d `
+
