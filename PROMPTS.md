@@ -11,13 +11,25 @@
 - **My reflection:** Starting with a small feature helped me understand the project structure before moving on to the security-related features.
 - **Commit:** 8bbebfc — add Flask application and health check test.
 
-## Entry 2: Fixing Authentication Test Failures
+## Entry 2: Debugging Authentication Tests
 
 - **Date:** 22 October 2026
-- **Task:** Fix the failing authentication tests.
-- **Prompt I used:** I shared my pytest output with ChatGPT and asked for help fixing the two failing tests.
-- **Problem:** The protected profile endpoint returned a `302` redirect instead of the expected `401 Unauthorized` response for unauthenticated users.
-- **What I changed:** I configured Flask-Login to return a JSON error response with HTTP status `401` when authentication is required.
-- **What I learned:** I learned the difference between an HTTP redirect and an unauthorized response, and why JSON APIs should return appropriate HTTP status codes.
-- **Testing:** Initially, four tests passed and two failed. Record the final result after rerunning pytest.
-- **Commit:** dfd6bc4 - return unauthorized responses for protected routes
+- **Task:** Fix the authentication tests and complete the initial authentication foundation.
+- **Prompt I used:** I shared my pytest output with ChatGPT and asked for help understanding why two authentication tests failed.
+- **Problem:** Flask-Login returned a `302` redirect when an unauthenticated user tried to access the profile endpoint, while my tests expected `401 Unauthorized`.
+- **What I changed:** I configured the application to return a JSON `401` response for unauthenticated requests and prepared the shared database extension and user model.
+- **What I learned:** I learned why API endpoints should return appropriate HTTP status codes and why the same database extension must be shared by the application, models, and tests.
+- **Testing:** The final test run reported `6 passed`.
+- **Relevant fix commit:** `dfd6bc4` — `fix: return unauthorized responses for protected routes`
+- **Authentication foundation commit:** Add the actual commit ID after committing the model and dependency changes.
+
+## Entry 3: Improving Session and CSRF Security
+
+- **Date:** 22 October 2026
+- **Task:** Improve the security of the Flask authentication system.
+- **Prompt I used:** I asked ChatGPT to provide the complete updated file contents so I could copy them into VS Code without merging code snippets manually.
+- **What I worked on:** I updated the Flask extensions, application configuration, user model, dependencies, and automated tests.
+- **What I learned:** I learned why the application needs a secret key, how session-cookie settings help protect sessions, and why CSRF protection matters for browser-based authentication.
+- **Testing:** The final test run reported 8 passed.
+- **My reflection:** Testing the security changes helped me understand that authentication features need automated checks, not just a successful login in the browser.
+- **Commit Id:**  `3e58941` 
