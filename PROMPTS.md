@@ -9,4 +9,4 @@
 - **What I learned:** I learned how to create a basic Flask application, return JSON responses, and test an endpoint without starting a separate server.
 - **Testing:** The health endpoint test passed, and I checked the endpoint in my browser.
 - **My reflection:** Starting with a small feature helped me understand the project structure before moving on to the security-related features.
-- **Commit:** To be recorded after the implementation commit.
+- **Commit:** 8bbebfc — add Flask application and health check test.
