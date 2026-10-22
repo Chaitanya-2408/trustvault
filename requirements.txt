@@ -1,2 +1,6 @@
 Flask
+Flask-Login
+Flask-SQLAlchemy
+Flask-Migrate
+python-dotenv
 pytest
