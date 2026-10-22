@@ -12,6 +12,7 @@ from flask_login import (
 from flask_wtf.csrf import CSRFError, generate_csrf
 from sqlalchemy.exc import IntegrityError
 
+from backend.audit import log_audit_event
 from backend.extensions import csrf, db, login_manager
 from backend.models import Document, DocumentPermission, User
 
@@ -177,7 +178,7 @@ def create_app(test_config=None):
     # ---------------- Authorization helpers ----------------
 
     def get_document_access(document):
-        """Return the current user's access, checking the database each time."""
+        """Check the current user's access against the database."""
         if document.owner_id == current_user.id:
             return "OWNER"
 
@@ -245,6 +246,18 @@ def create_app(test_config=None):
         )
 
         db.session.add(document)
+        db.session.flush()
+
+        log_audit_event(
+            action="DOCUMENT_CREATED",
+            outcome="SUCCESS",
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            document_id=document.id,
+            details={"category": document.category},
+            commit=False,
+        )
+
         db.session.commit()
 
         return jsonify(serialize_document(document, "OWNER")), 201
@@ -286,6 +299,15 @@ def create_app(test_config=None):
         access = get_document_access(document)
 
         if access not in ("OWNER", "READ", "EDIT"):
+            log_audit_event(
+                action="DOCUMENT_READ",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                details={"reason": "missing_permission"},
+            )
+
             return jsonify({"error": "Document access denied"}), 403
 
         return jsonify(serialize_document(document, access)), 200
@@ -301,6 +323,15 @@ def create_app(test_config=None):
         access = get_document_access(document)
 
         if access not in ("OWNER", "EDIT"):
+            log_audit_event(
+                action="DOCUMENT_UPDATE",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                details={"reason": "edit_permission_required"},
+            )
+
             return jsonify({"error": "Edit permission required"}), 403
 
         data = request.get_json(silent=True)
@@ -325,6 +356,22 @@ def create_app(test_config=None):
                 return jsonify({"error": "Invalid description"}), 400
             document.description = data["description"]
 
+        log_audit_event(
+            action="DOCUMENT_UPDATED",
+            outcome="SUCCESS",
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            document_id=document.id,
+            details={
+                "fields_changed": [
+                    field
+                    for field in ("title", "category", "description")
+                    if field in data
+                ]
+            },
+            commit=False,
+        )
+
         db.session.commit()
 
         return jsonify(serialize_document(document, access)), 200
@@ -340,6 +387,15 @@ def create_app(test_config=None):
             return jsonify({"error": "Document not found"}), 404
 
         if document.owner_id != current_user.id:
+            log_audit_event(
+                action="PERMISSION_GRANT",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                details={"reason": "not_document_owner"},
+            )
+
             return jsonify({
                 "error": "Only the document owner can grant permissions"
             }), 403
@@ -376,6 +432,8 @@ def create_app(test_config=None):
             )
         ).scalar_one_or_none()
 
+        is_new_grant = grant is None
+
         if grant is None:
             grant = DocumentPermission(
                 document_id=document.id,
@@ -385,6 +443,21 @@ def create_app(test_config=None):
             db.session.add(grant)
         else:
             grant.permission_level = level
+
+        log_audit_event(
+            action=(
+                "PERMISSION_GRANTED"
+                if is_new_grant
+                else "PERMISSION_CHANGED"
+            ),
+            outcome="SUCCESS",
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            document_id=document.id,
+            target_user_id=target.id,
+            details={"permission_level": level},
+            commit=False,
+        )
 
         db.session.commit()
 
@@ -406,6 +479,16 @@ def create_app(test_config=None):
             return jsonify({"error": "Document not found"}), 404
 
         if document.owner_id != current_user.id:
+            log_audit_event(
+                action="PERMISSION_REVOKE",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                target_user_id=user_id,
+                details={"reason": "not_document_owner"},
+            )
+
             return jsonify({
                 "error": "Only the document owner can revoke permissions"
             }), 403
@@ -420,7 +503,20 @@ def create_app(test_config=None):
         if grant is None:
             return jsonify({"error": "Permission grant not found"}), 404
 
+        revoked_level = grant.permission_level
         db.session.delete(grant)
+
+        log_audit_event(
+            action="PERMISSION_REVOKED",
+            outcome="SUCCESS",
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            document_id=document.id,
+            target_user_id=user_id,
+            details={"permission_level": revoked_level},
+            commit=False,
+        )
+
         db.session.commit()
 
         return jsonify({"message": "Permission revoked"}), 200

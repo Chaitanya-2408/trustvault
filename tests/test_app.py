@@ -400,3 +400,174 @@ def test_audit_chain_detects_modified_event(app):
 
         assert verify_audit_chain() is False
 
+
+
+def test_document_creation_and_update_are_audited(app):
+    client = app.test_client()
+    register_and_login(client, "owner@example.com")
+
+    response = create_document(client)
+    assert response.status_code == 201
+    document_id = response.get_json()["id"]
+
+    response = client.patch(
+        f"/documents/{document_id}",
+        json={"title": "Updated Project Plan"},
+        headers=csrf_headers(client),
+    )
+    assert response.status_code == 200
+
+    with app.app_context():
+        events = db.session.execute(
+            db.select(AuditLog)
+            .where(AuditLog.document_id == document_id)
+            .order_by(AuditLog.id.asc())
+        ).scalars().all()
+
+        assert [
+            (event.action, event.outcome)
+            for event in events
+        ] == [
+            ("DOCUMENT_CREATED", "SUCCESS"),
+            ("DOCUMENT_UPDATED", "SUCCESS"),
+        ]
+
+        assert events[1].details["fields_changed"] == ["title"]
+        assert verify_audit_chain() is True
+
+
+def test_denied_document_read_and_edit_are_audited(app):
+    owner = app.test_client()
+    viewer = app.test_client()
+
+    register_and_login(owner, "owner@example.com")
+    register_and_login(viewer, "viewer@example.com")
+
+    document_id = create_document(owner).get_json()["id"]
+
+    response = viewer.get(f"/documents/{document_id}")
+    assert response.status_code == 403
+
+    response = viewer.patch(
+        f"/documents/{document_id}",
+        json={"title": "Unauthorized change"},
+        headers=csrf_headers(viewer),
+    )
+    assert response.status_code == 403
+
+    with app.app_context():
+        events = db.session.execute(
+            db.select(AuditLog)
+            .where(
+                AuditLog.document_id == document_id,
+                AuditLog.outcome == "DENIED",
+            )
+            .order_by(AuditLog.id.asc())
+        ).scalars().all()
+
+        assert [
+            event.action for event in events
+        ] == [
+            "DOCUMENT_READ",
+            "DOCUMENT_UPDATE",
+        ]
+
+        assert all(
+            event.actor_email == "viewer@example.com"
+            for event in events
+        )
+
+        assert verify_audit_chain() is True
+
+
+def test_permission_grant_change_and_revoke_are_audited(app):
+    owner = app.test_client()
+    viewer = app.test_client()
+
+    register_and_login(owner, "owner@example.com")
+    register_and_login(viewer, "viewer@example.com")
+
+    document_id = create_document(owner).get_json()["id"]
+
+    # Grant READ permission.
+    response = grant_permission(
+        owner, document_id, "viewer@example.com", "READ"
+    )
+    assert response.status_code == 200
+    user_id = response.get_json()["user_id"]
+
+    # Change READ permission to EDIT.
+    response = grant_permission(
+        owner, document_id, "viewer@example.com", "EDIT"
+    )
+    assert response.status_code == 200
+
+    # Revoke the permission.
+    response = owner.delete(
+        f"/documents/{document_id}/permissions/{user_id}",
+        headers=csrf_headers(owner),
+    )
+    assert response.status_code == 200
+
+    with app.app_context():
+        events = db.session.execute(
+            db.select(AuditLog)
+            .where(AuditLog.document_id == document_id)
+            .order_by(AuditLog.id.asc())
+        ).scalars().all()
+
+        permission_events = [
+            event for event in events
+            if event.action.startswith("PERMISSION_")
+        ]
+
+        assert [
+            (event.action, event.outcome)
+            for event in permission_events
+        ] == [
+            ("PERMISSION_GRANTED", "SUCCESS"),
+            ("PERMISSION_CHANGED", "SUCCESS"),
+            ("PERMISSION_REVOKED", "SUCCESS"),
+        ]
+
+        assert all(
+            event.target_user_id == user_id
+            for event in permission_events
+        )
+
+        assert permission_events[0].details["permission_level"] == "READ"
+        assert permission_events[1].details["permission_level"] == "EDIT"
+        assert permission_events[2].details["permission_level"] == "EDIT"
+
+        assert verify_audit_chain() is True
+
+
+def test_denied_permission_grant_is_audited(app):
+    owner = app.test_client()
+    viewer = app.test_client()
+
+    register_and_login(owner, "owner@example.com")
+    register_and_login(viewer, "viewer@example.com")
+
+    document_id = create_document(owner).get_json()["id"]
+
+    response = grant_permission(
+        viewer, document_id, "owner@example.com", "EDIT"
+    )
+    assert response.status_code == 403
+
+    with app.app_context():
+        event = db.session.execute(
+            db.select(AuditLog)
+            .where(
+                AuditLog.document_id == document_id,
+                AuditLog.action == "PERMISSION_GRANT",
+                AuditLog.outcome == "DENIED",
+            )
+        ).scalar_one()
+
+        assert event.actor_email == "viewer@example.com"
+        assert event.details["reason"] == "not_document_owner"
+        assert verify_audit_chain() is True
+
+
