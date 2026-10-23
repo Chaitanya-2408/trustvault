@@ -6,6 +6,8 @@ from backend.extensions import db
 from backend.audit import log_audit_event, verify_audit_chain
 from backend.models import AuditLog, User
 
+from backend.email_service import send_email
+
 
 PASSWORD = "Correct-Horse-Battery-12"
 
@@ -672,3 +674,41 @@ def test_admin_cannot_read_document_without_permission(app):
     response = admin_client.get(f"/documents/{document_id}")
 
     assert response.status_code == 403
+
+
+
+def test_email_service_suppresses_sending_in_development(app, monkeypatch):
+    import backend.email_service as email_service
+
+    def unexpected_smtp(*args, **kwargs):
+        raise AssertionError("SMTP must not be called")
+
+    monkeypatch.setattr(email_service.smtplib, "SMTP", unexpected_smtp)
+    monkeypatch.setattr(email_service.smtplib, "SMTP_SSL", unexpected_smtp)
+
+    with app.app_context():
+        app.config["MAIL_SUPPRESS_SEND"] = True
+
+        send_email(
+            "test@example.com",
+            "Test email",
+            "This email must not be delivered.",
+        )
+
+
+def test_email_service_requires_server_configuration(app):
+    with app.app_context():
+        app.config["MAIL_SUPPRESS_SEND"] = False
+        app.config["MAIL_SERVER"] = ""
+        app.config["MAIL_DEFAULT_SENDER"] = ""
+
+        try:
+            send_email(
+                "test@example.com",
+                "Test email",
+                "Test body",
+            )
+        except RuntimeError as error:
+            assert "MAIL_SERVER" in str(error)
+        else:
+            raise AssertionError("Missing SMTP configuration must fail")
