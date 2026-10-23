@@ -571,3 +571,104 @@ def test_denied_permission_grant_is_audited(app):
         assert verify_audit_chain() is True
 
 
+
+def test_admin_audit_endpoint_requires_authentication(client):
+    response = client.get("/admin/audit-logs")
+
+    assert response.status_code == 401
+
+
+def test_viewer_cannot_access_admin_audit_endpoint(client):
+    register_and_login(client, "viewer@example.com")
+
+    response = client.get("/admin/audit-logs")
+
+    assert response.status_code == 403
+
+
+def test_admin_can_view_paginated_audit_events(app):
+    admin = app.test_client()
+
+    register_and_login(admin, "admin@example.com")
+
+    with app.app_context():
+        user = db.session.execute(
+            db.select(User).filter_by(email="admin@example.com")
+        ).scalar_one()
+        user.role = "admin"
+        db.session.commit()
+
+    # Log in again so the test uses the administrator's session.
+    response = login(admin, "admin@example.com")
+    assert response.status_code == 200
+
+    response = create_document(admin, title="Admin Test Document")
+    assert response.status_code == 201
+
+    response = admin.get("/admin/audit-logs?page=1&per_page=1")
+
+    assert response.status_code == 200
+
+    data = response.get_json()
+    assert data["page"] == 1
+    assert data["per_page"] == 1
+    assert data["total"] >= 1
+    assert len(data["events"]) == 1
+
+    event = data["events"][0]
+    assert "action" in event
+    assert "outcome" in event
+    assert "event_hash" in event
+    assert "previous_hash" in event
+
+
+def test_admin_audit_endpoint_rejects_invalid_pagination(client):
+    register_and_login(client, "viewer@example.com")
+
+    with client.application.app_context():
+        user = db.session.execute(
+            db.select(User).filter_by(email="viewer@example.com")
+        ).scalar_one()
+        user.role = "admin"
+        db.session.commit()
+
+    # Log in again after changing the role.
+    login(client, "viewer@example.com")
+
+    response = client.get("/admin/audit-logs?page=0")
+
+    assert response.status_code == 400
+
+    response = client.get("/admin/audit-logs?per_page=101")
+
+    assert response.status_code == 400
+
+
+
+def test_admin_cannot_read_document_without_permission(app):
+    owner_client = app.test_client()
+    register_and_login(owner_client, "owner@example.com")
+
+    response = create_document(
+        owner_client,
+        title="Private Owner Document",
+    )
+    assert response.status_code == 201
+    document_id = response.get_json()["id"]
+
+    admin_client = app.test_client()
+    register_and_login(admin_client, "admin@example.com")
+
+    with app.app_context():
+        admin = db.session.execute(
+            db.select(User).filter_by(email="admin@example.com")
+        ).scalar_one()
+        admin.role = "admin"
+        db.session.commit()
+
+    login_response = login(admin_client, "admin@example.com")
+    assert login_response.status_code == 200
+
+    response = admin_client.get(f"/documents/{document_id}")
+
+    assert response.status_code == 403

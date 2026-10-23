@@ -1,5 +1,5 @@
-
 import os
+from functools import wraps
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.audit import log_audit_event
 from backend.extensions import csrf, db, login_manager
-from backend.models import Document, DocumentPermission, User
+from backend.models import AuditLog, Document, DocumentPermission, User
 
 load_dotenv()
 
@@ -174,6 +174,23 @@ def create_app(test_config=None):
             "email": current_user.email,
             "role": current_user.role,
         }), 200
+
+    # ---------------- Admin authorization ----------------
+
+    def admin_required(view_function):
+        """Allow access only to authenticated administrators."""
+
+        @wraps(view_function)
+        @login_required
+        def wrapped(*args, **kwargs):
+            if current_user.role != "admin":
+                return jsonify({
+                    "error": "Administrator access required"
+                }), 403
+
+            return view_function(*args, **kwargs)
+
+        return wrapped
 
     # ---------------- Authorization helpers ----------------
 
@@ -350,9 +367,7 @@ def create_app(test_config=None):
             document.category = data["category"].strip()
 
         if "description" in data:
-            if not valid_text(
-                data["description"], 5000, allow_empty=True
-            ):
+            if not valid_text(data["description"], 5000, allow_empty=True):
                 return jsonify({"error": "Invalid description"}), 400
             document.description = data["description"]
 
@@ -520,5 +535,69 @@ def create_app(test_config=None):
         db.session.commit()
 
         return jsonify({"message": "Permission revoked"}), 200
+
+    # ---------------- Admin audit history ----------------
+
+    def admin_required(view_function):
+        """Allow access only to authenticated administrators."""
+
+        @wraps(view_function)
+        @login_required
+        def wrapped(*args, **kwargs):
+            if current_user.role != "admin":
+                return jsonify({
+                    "error": "Administrator access required"
+                }), 403
+
+            return view_function(*args, **kwargs)
+
+        return wrapped
+
+    @app.get("/admin/audit-logs")
+    @admin_required
+    def list_audit_logs():
+        """Return paginated audit metadata to administrators."""
+        try:
+            page = int(request.args.get("page", "1"))
+            per_page = int(request.args.get("per_page", "20"))
+        except (TypeError, ValueError):
+            return jsonify({
+                "error": "page and per_page must be integers"
+            }), 400
+
+        if page < 1 or per_page < 1 or per_page > 100:
+            return jsonify({
+                "error": "page must be positive and per_page must be between 1 and 100"
+            }), 400
+
+        pagination = db.paginate(
+            db.select(AuditLog).order_by(AuditLog.id.desc()),
+            page=page,
+            per_page=per_page,
+            error_out=False,
+        )
+
+        return jsonify({
+            "events": [
+                {
+                    "id": event.id,
+                    "actor_user_id": event.actor_user_id,
+                    "actor_email": event.actor_email,
+                    "action": event.action,
+                    "outcome": event.outcome,
+                    "document_id": event.document_id,
+                    "target_user_id": event.target_user_id,
+                    "details": event.details,
+                    "created_at": event.created_at.isoformat(),
+                    "previous_hash": event.previous_hash,
+                    "event_hash": event.event_hash,
+                }
+                for event in pagination.items
+            ],
+            "page": pagination.page,
+            "per_page": pagination.per_page,
+            "total": pagination.total,
+            "pages": pagination.pages,
+        }), 200
 
     return app
