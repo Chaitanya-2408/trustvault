@@ -4,7 +4,7 @@ import pytest
 from backend.app import create_app
 from backend.extensions import db
 from backend.audit import log_audit_event, verify_audit_chain
-from backend.models import AuditLog, CompanyMembership, User
+from backend.models import AuditLog, Company, CompanyMembership, User
 
 from backend.email_service import send_email
 
@@ -82,8 +82,8 @@ def login(client, email):
     )
 
 
-def register_and_login(client, email):
-    response = register(client, email)
+def register_and_login(client, email, company_name=None):
+    response = register(client, email, company_name)
 
     assert response.status_code == 201, (
         f"Registration failed for {email}: "
@@ -759,3 +759,177 @@ def test_email_service_requires_server_configuration(app):
             assert "MAIL_SERVER" in str(error)
         else:
             raise AssertionError("Missing SMTP configuration must fail")
+
+
+def test_multi_workspace_user_must_select_active_workspace_and_is_isolated(app):
+    owner_a = app.test_client()
+    owner_b = app.test_client()
+    shared = app.test_client()
+
+    register_and_login(owner_a, "owner-a@example.com")
+    register_and_login(owner_b, "owner-b@example.com")
+    register_and_login(shared, "shared@example.com")
+
+    doc_a = create_document(owner_a, title="Company A Secret").get_json()["id"]
+    doc_b = create_document(owner_b, title="Company B Secret").get_json()["id"]
+
+    with app.app_context():
+        owner_a_user = db.session.execute(
+            db.select(User).filter_by(email="owner-a@example.com")
+        ).scalar_one()
+        owner_b_user = db.session.execute(
+            db.select(User).filter_by(email="owner-b@example.com")
+        ).scalar_one()
+        shared_user = db.session.execute(
+            db.select(User).filter_by(email="shared@example.com")
+        ).scalar_one()
+        membership_a = db.session.execute(
+            db.select(CompanyMembership).filter_by(user_id=owner_a_user.id)
+        ).scalar_one()
+        membership_b = db.session.execute(
+            db.select(CompanyMembership).filter_by(user_id=owner_b_user.id)
+        ).scalar_one()
+        shared_membership = db.session.execute(
+            db.select(CompanyMembership).filter_by(user_id=shared_user.id)
+        ).scalar_one()
+
+        # Put the account into two workspaces. This models two separate
+        # invitations accepted by the same registered account.
+        shared_membership.company_id = membership_a.company_id
+        shared_membership.role = "member"
+        db.session.add(CompanyMembership(
+            company_id=membership_b.company_id,
+            user_id=shared_user.id,
+            role="member",
+        ))
+        db.session.commit()
+        company_a_id = membership_a.company_id
+        company_b_id = membership_b.company_id
+
+    # Workspace membership alone must not expose every document. Grant this
+    # shared account explicit READ access to one document in each workspace,
+    # then verify that switching workspaces scopes the listing correctly.
+    grant_a = grant_permission(owner_a, doc_a, "shared@example.com", "READ")
+    grant_b = grant_permission(owner_b, doc_b, "shared@example.com", "READ")
+    assert grant_a.status_code == 200, grant_a.get_json()
+    assert grant_b.status_code == 200, grant_b.get_json()
+
+    # Re-login so the session is initialized for a multi-workspace account.
+    assert login(shared, "shared@example.com").status_code == 200
+    assert shared.get("/documents").status_code == 403
+
+    response = shared.get("/companies")
+    assert response.status_code == 200
+    assert len(response.get_json()["companies"]) == 2
+
+    response = shared.post(
+        "/companies/active",
+        json={"company_id": company_a_id},
+        headers=csrf_headers(shared),
+    )
+    assert response.status_code == 200
+    listing = shared.get("/documents").get_json()["documents"]
+    assert [item["id"] for item in listing] == [doc_a]
+    assert shared.get(f"/documents/{doc_b}").status_code == 403
+
+    response = shared.post(
+        "/companies/active",
+        json={"company_id": company_b_id},
+        headers=csrf_headers(shared),
+    )
+    assert response.status_code == 200
+    listing = shared.get("/documents").get_json()["documents"]
+    assert [item["id"] for item in listing] == [doc_b]
+    assert shared.get(f"/documents/{doc_a}").status_code == 403
+
+
+def test_user_cannot_switch_to_unjoined_workspace(app):
+    member = app.test_client()
+    other = app.test_client()
+    register_and_login(member, "member@example.com")
+    register_and_login(other, "other@example.com")
+
+    with app.app_context():
+        other_user = db.session.execute(
+            db.select(User).filter_by(email="other@example.com")
+        ).scalar_one()
+        other_membership = db.session.execute(
+            db.select(CompanyMembership).filter_by(user_id=other_user.id)
+        ).scalar_one()
+        other_company_id = other_membership.company_id
+
+    response = member.post(
+        "/companies/active",
+        json={"company_id": other_company_id},
+        headers=csrf_headers(member),
+    )
+    assert response.status_code == 403
+    assert member.get("/documents").get_json()["documents"] == []
+
+
+def test_audit_logs_are_scoped_to_active_workspace_and_deleted_doc_history_remains(app):
+    owner_a = app.test_client()
+    owner_b = app.test_client()
+    register_and_login(owner_a, "audit-a@example.com")
+    register_and_login(owner_b, "audit-b@example.com")
+
+    doc_a_response = create_document(owner_a, title="Audit A")
+    doc_b_response = create_document(owner_b, title="Audit B")
+    doc_a = doc_a_response.get_json()["id"]
+    doc_b = doc_b_response.get_json()["id"]
+
+    with app.app_context():
+        user_a = db.session.execute(
+            db.select(User).filter_by(email="audit-a@example.com")
+        ).scalar_one()
+        membership_a = db.session.execute(
+            db.select(CompanyMembership).filter_by(user_id=user_a.id)
+        ).scalar_one()
+        company_a_id = membership_a.company_id
+
+    # Delete A's document. Its audit row should remain queryable in A's workspace.
+    response = owner_a.delete(f"/documents/{doc_a}", headers=csrf_headers(owner_a))
+    assert response.status_code == 200
+
+    events_a = owner_a.get("/admin/audit-logs?per_page=100").get_json()["events"]
+    assert any(
+        event["document_id"] == doc_a and event["action"] == "DOCUMENT_DELETED"
+        for event in events_a
+    )
+    assert not any(event["document_id"] == doc_b for event in events_a)
+
+    # A workspace switch audit event is scoped to the selected company.
+    with app.app_context():
+        rows = db.session.execute(
+            db.select(AuditLog).where(AuditLog.company_id == company_a_id)
+        ).scalars().all()
+        assert rows
+
+
+def test_workspace_admin_can_add_account_already_in_another_workspace(app):
+    admin = app.test_client()
+    member = app.test_client()
+    register_and_login(admin, "workspace-admin@example.com", "Workspace A")
+    register_and_login(member, "existing-member@example.com", "Workspace B")
+
+    response = admin.post(
+        "/admin/members",
+        json={"email": "existing-member@example.com"},
+        headers=csrf_headers(admin),
+    )
+    assert response.status_code == 201
+    assert response.get_json()["workspace_role"] == "member"
+
+    with app.app_context():
+        user = db.session.execute(
+            db.select(User).filter_by(email="existing-member@example.com")
+        ).scalar_one()
+        memberships = db.session.execute(
+            db.select(CompanyMembership).filter_by(user_id=user.id)
+        ).scalars().all()
+        assert len(memberships) == 2
+
+    # The account can now choose either workspace without changing the other.
+    assert login(member, "existing-member@example.com").status_code == 200
+    companies = member.get("/companies").get_json()["companies"]
+    assert len(companies) == 2

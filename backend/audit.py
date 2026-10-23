@@ -3,8 +3,10 @@ import hashlib
 import json
 from datetime import datetime
 
+from flask import has_request_context, session
+
 from backend.extensions import db
-from backend.models import AuditLog
+from backend.models import AuditLog, CompanyMembership, Document
 
 
 GENESIS_HASH = "0" * 64
@@ -19,6 +21,7 @@ def _event_payload(event):
         "action": event.action,
         "outcome": event.outcome,
         "document_id": event.document_id,
+        "company_id": event.company_id,
         "target_user_id": event.target_user_id,
         "details": event.details,
         "created_at": event.created_at.isoformat(),
@@ -46,6 +49,7 @@ def log_audit_event(
     document_id=None,
     target_user_id=None,
     details=None,
+    company_id=None,
     commit=True,
 ):
     """
@@ -73,12 +77,33 @@ def log_audit_event(
         else GENESIS_HASH
     )
 
+    # Resolve workspace ownership at event creation time. Explicit values take
+    # precedence; document events use the document's workspace; non-document
+    # events use the selected session workspace or an unambiguous membership.
+    if company_id is None and document_id is not None:
+        document = db.session.get(Document, document_id)
+        if document is not None:
+            company_id = document.company_id
+    if company_id is None and has_request_context():
+        selected_company_id = session.get("active_company_id")
+        if selected_company_id is not None:
+            company_id = selected_company_id
+    if company_id is None and actor_user_id is not None:
+        memberships = db.session.execute(
+            db.select(CompanyMembership.company_id).where(
+                CompanyMembership.user_id == actor_user_id
+            )
+        ).scalars().all()
+        if len(memberships) == 1:
+            company_id = memberships[0]
+
     event = AuditLog(
         actor_user_id=actor_user_id,
         actor_email=actor_email,
         action=action,
         outcome=outcome,
         document_id=document_id,
+        company_id=company_id,
         target_user_id=target_user_id,
         details=details or {},
         created_at=datetime.utcnow(),

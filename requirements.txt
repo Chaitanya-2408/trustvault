@@ -4,4 +4,6 @@ Flask-SQLAlchemy
 Flask-Migrate
 Flask-WTF
 python-dotenv
+SQLAlchemy
 pytest
+psycopg[binary]

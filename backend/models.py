@@ -116,6 +116,15 @@ class Document(db.Model):
     title = db.Column(db.String(255), nullable=False)
     category = db.Column(db.String(100), nullable=False, default="General")
     description = db.Column(db.Text, nullable=False, default="")
+    stored_filename = db.Column(
+    db.String(255),
+    nullable=True,
+    unique=True,
+    index=True,
+)
+    original_filename = db.Column(db.String(255), nullable=True)
+    content_type = db.Column(db.String(150), nullable=True)
+    file_size = db.Column(db.Integer, nullable=True)
     company = db.relationship("Company", backref="documents")
     owner_id = db.Column(
         db.Integer,
@@ -202,6 +211,9 @@ class AuditLog(db.Model):
     outcome = db.Column(db.String(20), nullable=False, index=True)
 
     document_id = db.Column(db.Integer, nullable=True, index=True)
+    # Workspace snapshot keeps audit history scoped after documents are deleted.
+    # Nullable for compatibility with audit rows created before this migration.
+    company_id = db.Column(db.Integer, nullable=True, index=True)
     target_user_id = db.Column(db.Integer, nullable=True)
 
     # Store safe metadata, never document contents, passwords, or tokens.

@@ -1,8 +1,15 @@
 import os
+import secrets
+from pathlib import Path
+
+from flask import send_file
+from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
+
 from functools import wraps
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, session
 from flask_login import (
     current_user,
     login_required,
@@ -28,6 +35,13 @@ load_dotenv()
 
 def create_app(test_config=None):
     app = Flask(__name__)
+
+    app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB
+    app.config["UPLOAD_FOLDER"] = os.path.join(
+        app.instance_path,
+        "private_uploads",
+    )
+    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
     cookie_secure = (
         os.environ.get("COOKIE_SECURE", "false").lower() == "true"
@@ -89,6 +103,10 @@ def create_app(test_config=None):
             "error": "CSRF validation failed",
             "description": error.description,
         }), 400
+
+    @app.errorhandler(RequestEntityTooLarge)
+    def handle_request_too_large(error):
+        return jsonify({"error": "Request exceeds the 10 MB limit"}), 413
 
     @app.cli.command("init-db")
     def init_db():
@@ -207,24 +225,118 @@ def create_app(test_config=None):
 
         login_user(user)
 
+        # Never carry a previous account's selected workspace into this login.
+        session.pop("active_company_id", None)
+        memberships = db.session.execute(
+            db.select(CompanyMembership).filter_by(user_id=user.id)
+        ).scalars().all()
+        if len(memberships) == 1:
+            session["active_company_id"] = memberships[0].company_id
+
         return jsonify({
             "message": "Logged in",
             "role": user.role,
+            "active_company_id": session.get("active_company_id"),
         }), 200
 
     @app.post("/logout")
     @login_required
     def logout():
         logout_user()
+        session.pop("active_company_id", None)
         return jsonify({"message": "Logged out"}), 200
 
     @app.get("/me")
     @login_required
     def me():
+        memberships = db.session.execute(
+            db.select(CompanyMembership, Company)
+            .join(Company, Company.id == CompanyMembership.company_id)
+            .where(CompanyMembership.user_id == current_user.id)
+            .order_by(Company.name.asc())
+        ).all()
+        active_membership = current_company_membership()
         return jsonify({
             "id": current_user.id,
             "email": current_user.email,
             "role": current_user.role,
+            "active_company_id": active_membership.company_id if active_membership else None,
+            "companies": [
+                {
+                    "id": membership.company_id,
+                    "name": company.name,
+                    "role": membership.role,
+                }
+                for membership, company in memberships
+            ],
+        }), 200
+
+    # ---------------- Workspace selection ----------------
+
+    @app.get("/companies")
+    @login_required
+    def list_companies():
+        rows = db.session.execute(
+            db.select(CompanyMembership, Company)
+            .join(Company, Company.id == CompanyMembership.company_id)
+            .where(CompanyMembership.user_id == current_user.id)
+            .order_by(Company.name.asc())
+        ).all()
+        return jsonify({
+            "companies": [
+                {
+                    "id": membership.company_id,
+                    "name": company.name,
+                    "role": membership.role,
+                    "active": session.get("active_company_id") == membership.company_id,
+                }
+                for membership, company in rows
+            ],
+            "active_company_id": session.get("active_company_id"),
+        }), 200
+
+    @app.post("/companies/active")
+    @login_required
+    def select_active_company():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "A JSON object is required"}), 400
+        try:
+            company_id = int(data.get("company_id"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "company_id must be an integer"}), 400
+
+        membership = db.session.execute(
+            db.select(CompanyMembership).filter_by(
+                user_id=current_user.id,
+                company_id=company_id,
+            )
+        ).scalar_one_or_none()
+        if membership is None:
+            log_audit_event(
+                action="WORKSPACE_SWITCH",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                details={"reason": "not_a_workspace_member", "requested_company_id": company_id},
+            )
+            return jsonify({"error": "You are not a member of that workspace"}), 403
+
+        session["active_company_id"] = membership.company_id
+        company = db.session.get(Company, membership.company_id)
+        log_audit_event(
+            action="WORKSPACE_SWITCH",
+            outcome="SUCCESS",
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            company_id=membership.company_id,
+            details={"company_id": membership.company_id},
+        )
+        return jsonify({
+            "message": "Active workspace changed",
+            "active_company_id": membership.company_id,
+            "company_name": company.name,
+            "workspace_role": membership.role,
         }), 200
 
     # ---------------- Admin authorization ----------------
@@ -249,17 +361,28 @@ def create_app(test_config=None):
 
 
     def current_company_membership():
-        """Return the user's only workspace membership, failing closed otherwise."""
+        """Resolve the active workspace from the session and verify membership.
+
+        A single-workspace account is selected automatically for backward
+        compatibility. Multi-workspace accounts must explicitly choose one.
+        """
         memberships = db.session.execute(
-            db.select(CompanyMembership).filter_by(
-                user_id=current_user.id,
-            )
+            db.select(CompanyMembership).filter_by(user_id=current_user.id)
         ).scalars().all()
 
-        if len(memberships) != 1:
-            return None
+        selected_id = session.get("active_company_id")
+        if selected_id is not None:
+            for membership in memberships:
+                if membership.company_id == selected_id:
+                    return membership
+            # Stale or forged workspace selection fails closed.
+            session.pop("active_company_id", None)
 
-        return memberships[0]
+        if len(memberships) == 1:
+            session["active_company_id"] = memberships[0].company_id
+            return memberships[0]
+
+        return None
 
 
     def user_is_company_member(user_id, company_id):
@@ -275,13 +398,14 @@ def create_app(test_config=None):
 
 
     def get_document_access(document):
-        """Require company membership before checking document permissions."""
+        """Require active-workspace membership before checking document grants."""
         if document.company_id is None:
             return None
 
-        if not user_is_company_member(
-            current_user.id,
-            document.company_id,
+        active_membership = current_company_membership()
+        if (
+            active_membership is None
+            or document.company_id != active_membership.company_id
         ):
             return None
 
@@ -309,6 +433,9 @@ def create_app(test_config=None):
             "description": document.description,
             "owner_id": document.owner_id,
             "access": access,
+            "has_file": bool(document.stored_filename),
+            "original_filename": document.original_filename,
+            "file_size": document.file_size,
             "created_at": document.created_at.isoformat(),
             "updated_at": document.updated_at.isoformat(),
         }
@@ -386,12 +513,15 @@ def create_app(test_config=None):
                 "error": "A single active company workspace is required"
             }), 403
 
-        documents = db.session.execute(
+        # Apply access control in SQL before applying user-controlled filters.
+        # A search query must never reveal documents the user cannot access.
+        statement = (
             db.select(Document)
             .outerjoin(
                 DocumentPermission,
                 DocumentPermission.document_id == Document.id,
             )
+            .join(User, User.id == Document.owner_id)
             .where(
                 Document.company_id == membership.company_id,
                 db.or_(
@@ -399,8 +529,47 @@ def create_app(test_config=None):
                     DocumentPermission.user_id == current_user.id,
                 ),
             )
-            .distinct()
-            .order_by(Document.created_at.desc())
+        )
+
+        title_query = request.args.get("title", "").strip()
+        owner_query = request.args.get("owner", "").strip().lower()
+        category_query = request.args.get("category", "").strip()
+        date_from = request.args.get("date_from", "").strip()
+        date_to = request.args.get("date_to", "").strip()
+
+        if title_query:
+            statement = statement.where(
+                Document.title.ilike(f"%{title_query}%")
+            )
+        if owner_query:
+            statement = statement.where(User.email.ilike(f"%{owner_query}%"))
+        if category_query:
+            statement = statement.where(
+                Document.category.ilike(f"%{category_query}%")
+            )
+        for field_name, date_value, operator in (
+            ("date_from", date_from, "from"),
+            ("date_to", date_to, "to"),
+        ):
+            if date_value:
+                try:
+                    from datetime import date
+                    parsed_date = date.fromisoformat(date_value)
+                except ValueError:
+                    return jsonify({
+                        "error": f"{field_name} must use YYYY-MM-DD format"
+                    }), 400
+                if operator == "from":
+                    statement = statement.where(
+                        db.func.date(Document.created_at) >= parsed_date.isoformat()
+                    )
+                else:
+                    statement = statement.where(
+                        db.func.date(Document.created_at) <= parsed_date.isoformat()
+                    )
+
+        documents = db.session.execute(
+            statement.distinct().order_by(Document.created_at.desc())
         ).scalars().all()
 
         results = [
@@ -433,6 +602,210 @@ def create_app(test_config=None):
             return jsonify({"error": "Document access denied"}), 403
 
         return jsonify(serialize_document(document, access)), 200
+
+    # ---------------- Private file upload/download ----------------
+
+    allowed_file_extensions = {
+        ".pdf", ".doc", ".docx", ".txt", ".csv",
+        ".xlsx", ".png", ".jpg", ".jpeg",
+    }
+
+    @app.post("/documents/<int:document_id>/upload")
+    @login_required
+    def upload_document_file(document_id):
+        document = document_or_404(document_id)
+
+        if document is None:
+            return jsonify({"error": "Document not found"}), 404
+
+        access = get_document_access(document)
+        if access not in ("OWNER", "EDIT"):
+            log_audit_event(
+                action="DOCUMENT_UPLOAD",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                details={"reason": "edit_permission_required"},
+            )
+            return jsonify({"error": "Edit permission required"}), 403
+
+        uploaded = request.files.get("file")
+        if uploaded is None or not uploaded.filename:
+            log_audit_event(
+                action="DOCUMENT_UPLOAD",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                details={"reason": "file_required"},
+            )
+            return jsonify({"error": "A file is required in the 'file' field"}), 400
+
+        original_filename = secure_filename(uploaded.filename)
+        extension = os.path.splitext(original_filename)[1].lower()
+
+        if (
+            not original_filename
+            or len(original_filename) > 255
+            or extension not in allowed_file_extensions
+        ):
+            log_audit_event(
+                action="DOCUMENT_UPLOAD",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                details={"reason": "invalid_file_type_or_name"},
+            )
+            return jsonify({
+                "error": "Unsupported filename or file type",
+                "allowed_extensions": sorted(allowed_file_extensions),
+            }), 400
+
+        storage_name = f"{secrets.token_hex(24)}{extension}"
+        storage_root = Path(app.config["UPLOAD_FOLDER"]).resolve()
+        storage_root.mkdir(parents=True, exist_ok=True)
+        storage_path = (storage_root / storage_name).resolve()
+
+        # The storage name is generated by the server, never from user input.
+        if storage_path.parent != storage_root:
+            return jsonify({"error": "Invalid storage path"}), 400
+
+        try:
+            uploaded.save(storage_path)
+            file_size = storage_path.stat().st_size
+
+            if file_size == 0:
+                storage_path.unlink(missing_ok=True)
+                log_audit_event(
+                    action="DOCUMENT_UPLOAD",
+                    outcome="DENIED",
+                    actor_user_id=current_user.id,
+                    actor_email=current_user.email,
+                    document_id=document.id,
+                    details={"reason": "empty_file"},
+                )
+                return jsonify({"error": "Empty files are not allowed"}), 400
+
+            if file_size > 10 * 1024 * 1024:
+                storage_path.unlink(missing_ok=True)
+                log_audit_event(
+                    action="DOCUMENT_UPLOAD",
+                    outcome="DENIED",
+                    actor_user_id=current_user.id,
+                    actor_email=current_user.email,
+                    document_id=document.id,
+                    details={"reason": "file_too_large", "file_size": file_size},
+                )
+                return jsonify({"error": "File exceeds the 10 MB limit"}), 413
+
+            old_storage_name = document.stored_filename
+            document.stored_filename = storage_name
+            document.original_filename = original_filename
+            document.content_type = uploaded.mimetype or "application/octet-stream"
+            document.file_size = file_size
+
+            log_audit_event(
+                action="DOCUMENT_UPLOADED",
+                outcome="SUCCESS",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                details={
+                    "filename": original_filename,
+                    "file_size": file_size,
+                    "content_type": document.content_type,
+                },
+                commit=False,
+            )
+            db.session.commit()
+
+        except Exception:
+            db.session.rollback()
+            storage_path.unlink(missing_ok=True)
+            raise
+
+        # Remove the previous stored file only after the database commit succeeds.
+        if old_storage_name:
+            old_path = (storage_root / old_storage_name).resolve()
+            if old_path.parent == storage_root and old_path != storage_path:
+                old_path.unlink(missing_ok=True)
+
+        return jsonify(serialize_document(document, access)), 200
+
+    @app.get("/documents/<int:document_id>/download")
+    @login_required
+    def download_document_file(document_id):
+        document = document_or_404(document_id)
+
+        if document is None:
+            return jsonify({"error": "Document not found"}), 404
+
+        access = get_document_access(document)
+        if access not in ("OWNER", "READ", "EDIT"):
+            log_audit_event(
+                action="DOCUMENT_DOWNLOAD",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                details={"reason": "missing_permission"},
+            )
+            return jsonify({"error": "Document access denied"}), 403
+
+        if not document.stored_filename:
+            log_audit_event(
+                action="DOCUMENT_DOWNLOAD",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                details={"reason": "file_not_attached"},
+            )
+            return jsonify({"error": "No file is attached to this document"}), 404
+
+        storage_root = Path(app.config["UPLOAD_FOLDER"]).resolve()
+        storage_path = (storage_root / document.stored_filename).resolve()
+
+        # Fail closed if the database value is malformed or escapes private storage.
+        if (
+            os.path.basename(document.stored_filename) != document.stored_filename
+            or storage_path.parent != storage_root
+            or not storage_path.is_file()
+        ):
+            log_audit_event(
+                action="DOCUMENT_DOWNLOAD",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                details={"reason": "stored_file_missing_or_invalid"},
+            )
+            return jsonify({"error": "Stored file not found"}), 404
+
+        log_audit_event(
+            action="DOCUMENT_DOWNLOADED",
+            outcome="SUCCESS",
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            document_id=document.id,
+            details={
+                "filename": document.original_filename,
+                "file_size": document.file_size,
+            },
+        )
+
+        response = send_file(
+            storage_path,
+            as_attachment=True,
+            download_name=document.original_filename or document.title,
+            mimetype=document.content_type or "application/octet-stream",
+            conditional=True,
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
     @app.patch("/documents/<int:document_id>")
     @login_required
@@ -495,6 +868,73 @@ def create_app(test_config=None):
         db.session.commit()
 
         return jsonify(serialize_document(document, access)), 200
+
+    @app.delete("/documents/<int:document_id>")
+    @login_required
+    def delete_document(document_id):
+        """Delete a document only when the authenticated user owns it."""
+        document = document_or_404(document_id)
+        if document is None:
+            return jsonify({"error": "Document not found"}), 404
+
+        access = get_document_access(document)
+        if access != "OWNER":
+            log_audit_event(
+                action="DOCUMENT_DELETE",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                details={"reason": "not_document_owner"},
+            )
+            return jsonify({"error": "Only the document owner can delete it"}), 403
+
+        stored_filename = document.stored_filename
+        document_id_snapshot = document.id
+        original_filename = document.original_filename
+
+        # Explicitly remove grants; audit rows intentionally remain as history.
+        db.session.execute(
+            db.delete(DocumentPermission).where(
+                DocumentPermission.document_id == document.id
+            )
+        )
+        db.session.delete(document)
+        log_audit_event(
+            action="DOCUMENT_DELETED",
+            outcome="SUCCESS",
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            document_id=document_id_snapshot,
+            company_id=document.company_id,
+            details={"filename": original_filename, "file_attached": bool(stored_filename)},
+            commit=False,
+        )
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            raise
+
+        # Remove the private file only after the DB transaction commits.
+        # Resolve and constrain the path to the configured storage directory.
+        if stored_filename:
+            storage_root = Path(app.config["UPLOAD_FOLDER"]).resolve()
+            storage_path = (storage_root / stored_filename).resolve()
+            if (
+                os.path.basename(stored_filename) == stored_filename
+                and storage_path.parent == storage_root
+                and storage_path.is_file()
+            ):
+                try:
+                    storage_path.unlink()
+                except OSError:
+                    app.logger.exception(
+                        "Document %s deleted but its stored file could not be removed",
+                        document_id_snapshot,
+                    )
+
+        return jsonify({"message": "Document deleted", "document_id": document_id_snapshot}), 200
 
     # ---------------- Owner-controlled permissions ----------------
 
@@ -655,6 +1095,117 @@ def create_app(test_config=None):
 
         return jsonify({"message": "Permission revoked"}), 200
 
+    # ---------------- Workspace member onboarding ----------------
+
+    @app.get("/admin/members")
+    @admin_required
+    def list_workspace_members():
+        """List member metadata for the administrator's active workspace."""
+        membership = current_company_membership()
+        if membership is None:
+            return jsonify({"error": "A single active company workspace is required"}), 403
+
+        rows = db.session.execute(
+            db.select(CompanyMembership, User)
+            .join(User, User.id == CompanyMembership.user_id)
+            .where(CompanyMembership.company_id == membership.company_id)
+            .order_by(CompanyMembership.created_at.asc())
+        ).all()
+
+        return jsonify({
+            "members": [
+                {
+                    "user_id": member.user_id,
+                    "email": user.email,
+                    "workspace_role": member.role,
+                    "joined_at": member.created_at.isoformat(),
+                }
+                for member, user in rows
+            ]
+        }), 200
+
+    @app.post("/admin/members")
+    @admin_required
+    def add_workspace_member():
+        """Add an existing account with no workspace to this workspace.
+
+        This endpoint intentionally does not create accounts or expose public
+        workspace-join links. Only an authenticated workspace admin can add a
+        registered account. Existing accounts may join multiple workspaces;
+        their other memberships and per-workspace roles are not changed.
+        """
+        membership = current_company_membership()
+        if membership is None:
+            return jsonify({"error": "A single active company workspace is required"}), 403
+
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "A JSON object is required"}), 400
+
+        email = data.get("email")
+        if not isinstance(email, str) or not email.strip() or len(email.strip()) > 255 or "@" not in email:
+            return jsonify({"error": "A valid email is required"}), 400
+        email = email.strip().lower()
+
+        target = db.session.execute(
+            db.select(User).filter_by(email=email)
+        ).scalar_one_or_none()
+        if target is None:
+            log_audit_event(
+                action="WORKSPACE_MEMBER_ADD",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                target_user_id=None,
+                company_id=membership.company_id,
+                details={"reason": "target_account_not_found", "target_email": email},
+            )
+            return jsonify({"error": "Register this account before adding it to the workspace"}), 404
+
+        if target.id == current_user.id:
+            return jsonify({"error": "You are already a workspace member"}), 409
+
+        existing_membership = db.session.execute(
+            db.select(CompanyMembership).filter_by(
+                user_id=target.id,
+                company_id=membership.company_id,
+            )
+        ).scalar_one_or_none()
+        if existing_membership is not None:
+            return jsonify({"error": "This user is already a member of this workspace"}), 409
+
+        # A registered account may belong to multiple workspaces. Membership and
+        # role are independent per workspace; adding it here does not move or
+        # alter the user's other memberships.
+        new_membership = CompanyMembership(
+            company_id=membership.company_id,
+            user_id=target.id,
+            role="member",
+        )
+        db.session.add(new_membership)
+        log_audit_event(
+            action="WORKSPACE_MEMBER_ADDED",
+            outcome="SUCCESS",
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            target_user_id=target.id,
+            company_id=membership.company_id,
+            details={"workspace_id": membership.company_id, "target_email": email},
+            commit=False,
+        )
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify({"error": "Could not add this account to the workspace"}), 409
+
+        return jsonify({
+            "message": "Workspace member added",
+            "user_id": target.id,
+            "email": target.email,
+            "workspace_role": "member",
+        }), 201
+
     # ---------------- Admin audit history ----------------
 
     @app.get("/admin/audit-logs")
@@ -683,9 +1234,18 @@ def create_app(test_config=None):
         workspace_document_ids = db.select(Document.id).where(
             Document.company_id == membership.company_id
         )
+        # New audit records carry a workspace snapshot, so events remain visible
+        # after a document is deleted without leaking events from another company.
+        # The document-ID clause is a safe compatibility path for pre-migration rows.
         pagination = db.paginate(
             db.select(AuditLog)
-            .where(AuditLog.document_id.in_(workspace_document_ids))
+            .where(db.or_(
+                AuditLog.company_id == membership.company_id,
+                db.and_(
+                    AuditLog.company_id.is_(None),
+                    AuditLog.document_id.in_(workspace_document_ids),
+                ),
+            ))
             .order_by(AuditLog.id.desc()),
             page=page,
             per_page=per_page,
