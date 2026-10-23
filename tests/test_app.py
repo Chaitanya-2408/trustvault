@@ -4,7 +4,7 @@ import pytest
 from backend.app import create_app
 from backend.extensions import db
 from backend.audit import log_audit_event, verify_audit_chain
-from backend.models import AuditLog, User
+from backend.models import AuditLog, CompanyMembership, User
 
 from backend.email_service import send_email
 
@@ -59,10 +59,17 @@ def csrf_headers(client):
     return {"X-CSRFToken": token}
 
 
-def register(client, email):
+def register(client, email, company_name=None):
+    if company_name is None:
+        company_name = f"{email.split('@')[0]}'s Workspace"
+
     return client.post(
         "/register",
-        json={"email": email, "password": PASSWORD},
+        json={
+            "email": email,
+            "password": PASSWORD,
+            "company_name": company_name,
+        },
         headers=csrf_headers(client),
     )
 
@@ -91,6 +98,41 @@ def register_and_login(client, email):
         f"status={response.status_code}, "
         f"body={response.get_json()}"
     )
+
+
+def put_user_in_same_company(app, owner_email, member_email):
+    """Move a test user into the owner's workspace as a regular member."""
+    with app.app_context():
+        owner = db.session.execute(
+            db.select(User).filter_by(email=owner_email)
+        ).scalar_one()
+        member = db.session.execute(
+            db.select(User).filter_by(email=member_email)
+        ).scalar_one()
+
+        owner_membership = db.session.execute(
+            db.select(CompanyMembership).filter_by(user_id=owner.id)
+        ).scalar_one()
+        member_membership = db.session.execute(
+            db.select(CompanyMembership).filter_by(user_id=member.id)
+        ).scalar_one()
+
+        member_membership.company_id = owner_membership.company_id
+        member_membership.role = "member"
+        db.session.commit()
+
+
+def set_company_membership_role(app, email, role):
+    """Set a test user's workspace role explicitly."""
+    with app.app_context():
+        user = db.session.execute(
+            db.select(User).filter_by(email=email)
+        ).scalar_one()
+        membership = db.session.execute(
+            db.select(CompanyMembership).filter_by(user_id=user.id)
+        ).scalar_one()
+        membership.role = role
+        db.session.commit()
 
 
 def create_document(client, title="Project Plan"):
@@ -252,6 +294,7 @@ def test_read_permission_allows_reading_but_not_editing(app):
 
     register_and_login(owner, "owner@example.com")
     register_and_login(viewer, "viewer@example.com")
+    put_user_in_same_company(app, "owner@example.com", "viewer@example.com")
 
     document_id = create_document(owner).get_json()["id"]
 
@@ -284,6 +327,7 @@ def test_edit_permission_allows_reading_and_editing(app):
 
     register_and_login(owner, "owner@example.com")
     register_and_login(editor, "editor@example.com")
+    put_user_in_same_company(app, "owner@example.com", "editor@example.com")
 
     document_id = create_document(owner).get_json()["id"]
 
@@ -313,6 +357,7 @@ def test_revoking_permission_blocks_subsequent_requests(app):
 
     register_and_login(owner, "owner@example.com")
     register_and_login(viewer, "viewer@example.com")
+    put_user_in_same_company(app, "owner@example.com", "viewer@example.com")
 
     document_id = create_document(owner).get_json()["id"]
 
@@ -488,6 +533,7 @@ def test_permission_grant_change_and_revoke_are_audited(app):
 
     register_and_login(owner, "owner@example.com")
     register_and_login(viewer, "viewer@example.com")
+    put_user_in_same_company(app, "owner@example.com", "viewer@example.com")
 
     document_id = create_document(owner).get_json()["id"]
 
@@ -582,6 +628,7 @@ def test_admin_audit_endpoint_requires_authentication(client):
 
 def test_viewer_cannot_access_admin_audit_endpoint(client):
     register_and_login(client, "viewer@example.com")
+    set_company_membership_role(app=client.application, email="viewer@example.com", role="member")
 
     response = client.get("/admin/audit-logs")
 

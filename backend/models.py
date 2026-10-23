@@ -18,6 +18,12 @@ class User(UserMixin, db.Model):
     password_hash = db.Column(db.String(255), nullable=False)
     role = db.Column(db.String(20), nullable=False, default="viewer")
 
+    memberships = db.relationship(
+        "CompanyMembership",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
 
@@ -25,11 +31,92 @@ class User(UserMixin, db.Model):
         return check_password_hash(self.password_hash, password)
 
 
+class Company(db.Model):
+    __tablename__ = "company"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), nullable=False)
+    created_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+    )
+
+    memberships = db.relationship(
+        "CompanyMembership",
+        back_populates="company",
+        cascade="all, delete-orphan",
+    )
+
+
+
+class CompanyMembership(db.Model):
+    __tablename__ = "company_membership"
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "company_id",
+            "user_id",
+            name="uq_company_membership_user",
+        ),
+        db.CheckConstraint(
+            "role IN ('admin', 'member')",
+            name="ck_company_membership_role",
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    company_id = db.Column(
+        db.Integer,
+        db.ForeignKey("company.id"),
+        nullable=False,
+        index=True,
+    )
+
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey("user.id"),
+        nullable=False,
+        index=True,
+    )
+
+    role = db.Column(
+        db.String(20),
+        nullable=False,
+        default="member",
+    )
+
+    created_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+    )
+
+    company = db.relationship(
+        "Company",
+        back_populates="memberships",
+    )
+
+    user = db.relationship(
+        "User",
+        back_populates="memberships",
+    )
+
+
+
 class Document(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(
+        db.Integer,
+        db.ForeignKey("company.id"),
+        nullable=True,
+        index=True,
+    )
     title = db.Column(db.String(255), nullable=False)
     category = db.Column(db.String(100), nullable=False, default="General")
     description = db.Column(db.Text, nullable=False, default="")
+    company = db.relationship("Company", backref="documents")
     owner_id = db.Column(
         db.Integer,
         db.ForeignKey("user.id"),

@@ -105,3 +105,16 @@
 **Validation:** `python -m pytest -q` — 27 tests passed in 3.76 seconds.
 
 **Commit:** `6eb8895 `
+
+
+### Entry 9  — Company workspace isolation and test fixes
+
+**Date:** 23 October 2026
+
+**Prompt:** Help me update TrustVault's Flask application to enforce company workspace isolation, prevent document permissions from being granted across companies, and correct the tests without weakening the security rules.
+
+**Work completed:** Updated the document access logic to check company membership, restricted document listings to the user's workspace, and updated the tests so users who need to share documents belong to the same workspace. Also corrected the administrator audit-access test setup.
+
+**Validation:** Ran `python -m pytest -q`. Result: **27 passed in 3.98 seconds**.
+
+**Learning:** Company membership must be checked in addition to document permissions. A user from another company should not gain access simply because a document permission exists.

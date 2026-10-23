@@ -13,8 +13,15 @@ from flask_wtf.csrf import CSRFError, generate_csrf
 from sqlalchemy.exc import IntegrityError
 
 from backend.audit import log_audit_event
-from backend.extensions import csrf, db, login_manager
-from backend.models import AuditLog, Document, DocumentPermission, User
+from backend.extensions import csrf, db, login_manager, migrate
+from backend.models import (
+    AuditLog,
+    Company,
+    CompanyMembership,
+    Document,
+    DocumentPermission,
+    User,
+)
 
 load_dotenv()
 
@@ -39,7 +46,7 @@ def create_app(test_config=None):
         REMEMBER_COOKIE_HTTPONLY=True,
         REMEMBER_COOKIE_SECURE=cookie_secure,
 
-        
+
         MAIL_SERVER=os.environ.get("MAIL_SERVER", ""),
         MAIL_PORT=int(os.environ.get("MAIL_PORT", "587")),
         MAIL_USE_TLS=os.environ.get(
@@ -70,6 +77,7 @@ def create_app(test_config=None):
     db.init_app(app)
     login_manager.init_app(app)
     csrf.init_app(app)
+    migrate.init_app(app, db)
 
     @login_manager.unauthorized_handler
     def unauthorized():
@@ -101,6 +109,7 @@ def create_app(test_config=None):
 
     # ---------------- Authentication ----------------
 
+
     @app.post("/register")
     def register():
         data = request.get_json(silent=True)
@@ -110,13 +119,20 @@ def create_app(test_config=None):
 
         email = data.get("email", "")
         password = data.get("password", "")
+        company_name = data.get("company_name", "")
 
         if not isinstance(email, str) or not isinstance(password, str):
             return jsonify({
                 "error": "Email and password must be strings"
             }), 400
 
+        if not isinstance(company_name, str):
+            return jsonify({
+                "error": "Company name must be a string"
+            }), 400
+
         email = email.strip().lower()
+        company_name = company_name.strip()
 
         if (
             not email
@@ -132,11 +148,27 @@ def create_app(test_config=None):
                 "error": "Password must be at least 12 characters"
             }), 400
 
+        if not company_name or len(company_name) > 200:
+            return jsonify({
+                "error": "Company name must be between 1 and 200 characters"
+            }), 400
+
         user = User(email=email, role="viewer")
         user.set_password(password)
-        db.session.add(user)
+
+        company = Company(name=company_name)
+
+        # The workspace creator becomes its first company administrator.
+        membership = CompanyMembership(
+            company=company,
+            user=user,
+            role="admin",
+        )
+
+        db.session.add_all([user, company, membership])
 
         try:
+            # Create all three records in one transaction.
             db.session.commit()
         except IntegrityError:
             db.session.rollback()
@@ -145,6 +177,7 @@ def create_app(test_config=None):
             }), 409
 
         return jsonify({"message": "Account created"}), 201
+
 
     @app.post("/login")
     def login():
@@ -197,12 +230,13 @@ def create_app(test_config=None):
     # ---------------- Admin authorization ----------------
 
     def admin_required(view_function):
-        """Allow access only to authenticated administrators."""
+        """Allow only workspace administrators to access admin endpoints."""
 
         @wraps(view_function)
         @login_required
         def wrapped(*args, **kwargs):
-            if current_user.role != "admin":
+            membership = current_company_membership()
+            if membership is None or membership.role != "admin":
                 return jsonify({
                     "error": "Administrator access required"
                 }), 403
@@ -213,8 +247,44 @@ def create_app(test_config=None):
 
     # ---------------- Authorization helpers ----------------
 
+
+    def current_company_membership():
+        """Return the user's only workspace membership, failing closed otherwise."""
+        memberships = db.session.execute(
+            db.select(CompanyMembership).filter_by(
+                user_id=current_user.id,
+            )
+        ).scalars().all()
+
+        if len(memberships) != 1:
+            return None
+
+        return memberships[0]
+
+
+    def user_is_company_member(user_id, company_id):
+        """Check workspace membership directly in the database."""
+        membership_id = db.session.execute(
+            db.select(CompanyMembership.id).filter_by(
+                user_id=user_id,
+                company_id=company_id,
+            )
+        ).scalar_one_or_none()
+
+        return membership_id is not None
+
+
     def get_document_access(document):
-        """Check the current user's access against the database."""
+        """Require company membership before checking document permissions."""
+        if document.company_id is None:
+            return None
+
+        if not user_is_company_member(
+            current_user.id,
+            document.company_id,
+        ):
+            return None
+
         if document.owner_id == current_user.id:
             return "OWNER"
 
@@ -226,6 +296,7 @@ def create_app(test_config=None):
         ).scalar_one_or_none()
 
         return grant.permission_level if grant else None
+
 
     def document_or_404(document_id):
         return db.session.get(Document, document_id)
@@ -265,6 +336,13 @@ def create_app(test_config=None):
         category = data.get("category", "General")
         description = data.get("description", "")
 
+        membership = current_company_membership()
+
+        if membership is None:
+            return jsonify({
+                "error": "A single active company workspace is required"
+            }), 403
+
         if not valid_text(title, 255):
             return jsonify({"error": "A valid title is required"}), 400
 
@@ -275,6 +353,7 @@ def create_app(test_config=None):
             return jsonify({"error": "Invalid description"}), 400
 
         document = Document(
+            company_id=membership.company_id,
             title=title.strip(),
             category=category.strip(),
             description=description,
@@ -301,6 +380,12 @@ def create_app(test_config=None):
     @app.get("/documents")
     @login_required
     def list_documents():
+        membership = current_company_membership()
+        if membership is None:
+            return jsonify({
+                "error": "A single active company workspace is required"
+            }), 403
+
         documents = db.session.execute(
             db.select(Document)
             .outerjoin(
@@ -308,10 +393,11 @@ def create_app(test_config=None):
                 DocumentPermission.document_id == Document.id,
             )
             .where(
+                Document.company_id == membership.company_id,
                 db.or_(
                     Document.owner_id == current_user.id,
                     DocumentPermission.user_id == current_user.id,
-                )
+                ),
             )
             .distinct()
             .order_by(Document.created_at.desc())
@@ -420,7 +506,7 @@ def create_app(test_config=None):
         if document is None:
             return jsonify({"error": "Document not found"}), 404
 
-        if document.owner_id != current_user.id:
+        if get_document_access(document) != "OWNER":
             log_audit_event(
                 action="PERMISSION_GRANT",
                 outcome="DENIED",
@@ -458,6 +544,20 @@ def create_app(test_config=None):
             return jsonify({
                 "error": "The owner already has full document access"
             }), 400
+
+        if not user_is_company_member(target.id, document.company_id):
+            log_audit_event(
+                action="PERMISSION_GRANT",
+                outcome="DENIED",
+                actor_user_id=current_user.id,
+                actor_email=current_user.email,
+                document_id=document.id,
+                target_user_id=target.id,
+                details={"reason": "target_not_company_member"},
+            )
+            return jsonify({
+                "error": "Permission can only be granted to a member of the same company"
+            }), 403
 
         grant = db.session.execute(
             db.select(DocumentPermission).filter_by(
@@ -512,7 +612,7 @@ def create_app(test_config=None):
         if document is None:
             return jsonify({"error": "Document not found"}), 404
 
-        if document.owner_id != current_user.id:
+        if get_document_access(document) != "OWNER":
             log_audit_event(
                 action="PERMISSION_REVOKE",
                 outcome="DENIED",
@@ -557,21 +657,6 @@ def create_app(test_config=None):
 
     # ---------------- Admin audit history ----------------
 
-    def admin_required(view_function):
-        """Allow access only to authenticated administrators."""
-
-        @wraps(view_function)
-        @login_required
-        def wrapped(*args, **kwargs):
-            if current_user.role != "admin":
-                return jsonify({
-                    "error": "Administrator access required"
-                }), 403
-
-            return view_function(*args, **kwargs)
-
-        return wrapped
-
     @app.get("/admin/audit-logs")
     @admin_required
     def list_audit_logs():
@@ -589,8 +674,19 @@ def create_app(test_config=None):
                 "error": "page must be positive and per_page must be between 1 and 100"
             }), 400
 
+        membership = current_company_membership()
+        if membership is None:
+            return jsonify({
+                "error": "A single active company workspace is required"
+            }), 403
+
+        workspace_document_ids = db.select(Document.id).where(
+            Document.company_id == membership.company_id
+        )
         pagination = db.paginate(
-            db.select(AuditLog).order_by(AuditLog.id.desc()),
+            db.select(AuditLog)
+            .where(AuditLog.document_id.in_(workspace_document_ids))
+            .order_by(AuditLog.id.desc()),
             page=page,
             per_page=per_page,
             error_out=False,
