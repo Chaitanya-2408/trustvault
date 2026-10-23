@@ -91,3 +91,17 @@
 **Validation:** `python -m pytest -q` — 25 tests passed in 3.80 seconds.
 
 **Commit:** `242b08e`
+
+### Entry 8 — Email service foundation
+
+**Date:** 23 October 2026
+
+**Prompt:** Help me set up a reusable email service in the TrustVault Flask backend with environment-based SMTP configuration and safe automated tests.
+
+**Work completed:** Added `backend/email_service.py` using Python's standard email and SMTP libraries. Added environment-based email settings to the Flask application and updated `.env.example`. Added tests to verify that email sending is suppressed during development and that missing SMTP configuration raises an error.
+
+**Security considerations:** Email credentials are configured through environment variables and should never be committed to Git. Email delivery is suppressed during development and testing. Real SMTP delivery and OTP authentication have not yet been implemented or verified.
+
+**Validation:** `python -m pytest -q` — 27 tests passed in 3.76 seconds.
+
+**Commit:** `6eb8895 `
