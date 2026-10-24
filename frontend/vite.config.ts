@@ -16,6 +16,7 @@ export default defineConfig({
       "/logout": "http://127.0.0.1:5000",
       "/me": "http://127.0.0.1:5000",
       "/companies": "http://127.0.0.1:5000",
+      "/company": "http://127.0.0.1:5000",
       "/documents": "http://127.0.0.1:5000",
       "/admin": "http://127.0.0.1:5000"
     }

@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
-type Company = { id: number; name: string; role: "admin" | "member" | "viewer"; active?: boolean };
+type Company = { id: number; name: string; role: "admin" | "member" | "viewer"; active?: boolean; is_owner?: boolean };
 type User = { id: number; email: string; role: string; active_company_id: number | null; companies: Company[] };
 type DocumentItem = {
   id: number; title: string; category: string; description: string; owner_id: number;
@@ -55,6 +55,7 @@ function App() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [companyName, setCompanyName] = useState("");
+  const [requestedRole, setRequestedRole] = useState<"admin" | "member" | "viewer">("member");
   const [companies, setCompanies] = useState<Company[]>([]);
   const [activeCompanyId, setActiveCompanyId] = useState<number | null>(null);
   const [tab, setTab] = useState<Tab>("documents");
@@ -69,10 +70,11 @@ function App() {
   const [newDescription, setNewDescription] = useState("");
   const [grantEmail, setGrantEmail] = useState("");
   const [grantLevel, setGrantLevel] = useState<"READ" | "EDIT">("READ");
-  const [revokeUserId, setRevokeUserId] = useState("");
+  const [revokeEmail, setRevokeEmail] = useState("");
   const [memberEmail, setMemberEmail] = useState("");
   const [memberRole, setMemberRole] = useState<"member" | "viewer">("member");
   const [joinRequests, setJoinRequests] = useState<JoinRequest[]>([]);
+  const [deleteCompanyConfirm, setDeleteCompanyConfirm] = useState("");
   const [inviteToken, setInviteToken] = useState(() => new URLSearchParams(window.location.search).get("token") || "");
   const [inviteInfo, setInviteInfo] = useState<InvitationInfo | null>(null);
   const [invitePassword, setInvitePassword] = useState("");
@@ -159,7 +161,7 @@ function App() {
     event.preventDefault();
     await runAction(async () => {
       if (authMode === "register") {
-        const result = await api<{ message: string; status?: string; notification_sent?: boolean }>("/register", { method: "POST", body: JSON.stringify({ email, password, company_name: companyName }) });
+        const result = await api<{ message: string; status?: string; notification_sent?: boolean }>("/register", { method: "POST", body: JSON.stringify({ email, password, company_name: companyName, requested_role: requestedRole }) });
         setMessage(result.notification_sent === false ? `${result.message} Email notification was not delivered; the administrator must be contacted until SMTP is configured.` : (result.message || "Registration request submitted."));
         setAuthMode("login");
         setPassword("");
@@ -317,11 +319,25 @@ function App() {
     event.preventDefault();
     if (!selectedDoc) return;
     await runAction(async () => {
-      await api(`/documents/${selectedDoc.id}/permissions/${Number(revokeUserId)}`, {
-        method: "DELETE", body: JSON.stringify({})
+      await api(`/documents/${selectedDoc.id}/permissions/by-email`, {
+        method: "DELETE", body: JSON.stringify({ email: revokeEmail })
       });
-      setRevokeUserId("");
+      setRevokeEmail("");
       setMessage("Permission revoked.");
+    });
+  }
+
+  async function deleteCompanyPermanently() {
+    if (!user || !activeCompanyId) return;
+    const active = user.companies.find((c) => c.id === activeCompanyId);
+    if (!active || active.role !== "admin") return;
+    const confirmed = window.confirm("This permanently deletes the company, documents, memberships, invitations and workspace data. Personal user accounts remain. Continue?");
+    if (!confirmed) return;
+    await runAction(async () => {
+      await api("/company", { method: "DELETE", body: JSON.stringify({ confirm_name: active.name }) });
+      setDeleteCompanyConfirm("");
+      setMessage("Company and all workspace data permanently deleted.");
+      await refreshMe();
     });
   }
 
@@ -368,7 +384,7 @@ function App() {
   async function createWorkspace(event: FormEvent) {
     event.preventDefault();
     await runAction(async () => {
-      const result = await api<{ message: string; status?: string; notification_sent?: boolean }>("/companies", { method: "POST", body: JSON.stringify({ name: companyName }) });
+      const result = await api<{ message: string; status?: string; notification_sent?: boolean }>("/companies", { method: "POST", body: JSON.stringify({ name: companyName, requested_role: requestedRole }) });
       if (result.status === "pending" || result.message?.toLowerCase().includes("approval")) {
         setWorkspaceRequestPending(true);
         setMessage(result.notification_sent === false ? `${result.message} Administrator email was not delivered; SMTP configuration is required.` : result.message);
@@ -408,7 +424,7 @@ function App() {
             <form onSubmit={submitAuth} className="stack">
               <label>Email address<input type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} required placeholder="you@company.com" /></label>
               <label>Password<input type="password" autoComplete={authMode === "login" ? "current-password" : "new-password"} minLength={12} value={password} onChange={(e) => setPassword(e.target.value)} required placeholder="At least 12 characters" /></label>
-              {authMode === "register" && <><label>Company / workspace name<input value={companyName} onChange={(e) => setCompanyName(e.target.value)} maxLength={200} required placeholder="Your organization" /></label><small className="muted">If this company already exists, its administrators must approve your administrator request.</small></>}
+              {authMode === "register" && <><label>Company / workspace name<input value={companyName} onChange={(e) => setCompanyName(e.target.value)} maxLength={200} required placeholder="Your organization" /></label><label>Access type if this company already exists<select value={requestedRole} onChange={(e) => setRequestedRole(e.target.value as "admin" | "member" | "viewer")}><option value="member">Member</option><option value="viewer">Viewer</option><option value="admin">Administrator (requires approval)</option></select></label><small className="muted">If the company does not exist, you'll become its first administrator. If it exists, its administrators must approve your selected role.</small></>}
               <button className="primary auth-submit" disabled={busy}>{busy ? "Please wait…" : authMode === "login" ? "Continue securely →" : "Create workspace →"}</button>
             </form>
             {authMode === "login" && <button className="text-button" type="button" onClick={() => { setAuthStep("forgot"); setError(""); setMessage(""); }}>Forgot password?</button>}
@@ -428,7 +444,7 @@ function App() {
       <main className="auth-shell"><section className="auth-card">
         <div className="brand-mark">TV</div><p className="eyebrow">WORKSPACE SETUP</p><h1>Welcome to TrustVault</h1>
         <p className="muted">Signed in as {user.email}. Create a new workspace or request administrator approval for an existing company.</p>
-        {workspaceRequestPending ? <><p className="notice success">Your request is pending. The company's current administrators must approve it before you can access the workspace.</p><button className="secondary" onClick={() => runAction(async () => { const me = await api<User>("/me"); setUser(me); setCompanies(me.companies || []); setActiveCompanyId(me.active_company_id); if (me.companies.length) setWorkspaceRequestPending(false); else setMessage("No approval yet. Please check again later."); })}>Check approval status</button></> : <form onSubmit={createWorkspace} className="stack"><label>Company / workspace name<input value={companyName} onChange={(e) => setCompanyName(e.target.value)} maxLength={200} required /></label><button className="primary" disabled={busy}>{busy ? "Please wait…" : "Create workspace / Request access"}</button></form>}
+        {workspaceRequestPending ? <><p className="notice success">Your request is pending. The company's current administrators must approve it before you can access the workspace.</p><button className="secondary" onClick={() => runAction(async () => { const me = await api<User>("/me"); setUser(me); setCompanies(me.companies || []); setActiveCompanyId(me.active_company_id); if (me.companies.length) setWorkspaceRequestPending(false); else setMessage("No approval yet. Please check again later."); })}>Check approval status</button></> : <form onSubmit={createWorkspace} className="stack"><label>Company / workspace name<input value={companyName} onChange={(e) => setCompanyName(e.target.value)} maxLength={200} required /></label><label>Requested role if the company already exists<select value={requestedRole} onChange={(e) => setRequestedRole(e.target.value as "admin" | "member" | "viewer")}><option value="member">Member</option><option value="viewer">Viewer</option><option value="admin">Administrator (requires approval)</option></select></label><small className="muted">If the company does not exist, you become its original administrator. If it exists, its administrators receive an email and must approve your requested role.</small><button className="primary" disabled={busy}>{busy ? "Please wait…" : "Create workspace / Request access"}</button></form>}
         <button className="secondary" onClick={logout}>Sign out</button>
         {error && <p className="notice error">{error}</p>}{message && <p className="notice success">{message}</p>}
       </section></main>
@@ -525,7 +541,7 @@ function App() {
                       <button className="secondary" disabled={busy}>Grant</button>
                     </form>
                     <form className="inline-form revoke-form" onSubmit={revokePermission}>
-                      <input inputMode="numeric" placeholder="User ID to revoke" value={revokeUserId} onChange={(e) => setRevokeUserId(e.target.value)} required />
+                      <input type="email" placeholder="Email address to revoke" value={revokeEmail} onChange={(e) => setRevokeEmail(e.target.value)} required />
                       <button className="secondary danger-outline" disabled={busy}>Revoke access</button>
                     </form>
                     <small className="muted">The target account must already be a member of this workspace. Use the member list to find the user ID.</small>
@@ -537,7 +553,7 @@ function App() {
           </div>
         ) : tab === "members" ? (
           <section className="panel wide-panel">
-            <div className="panel-heading"><div><h2>Members</h2><p>Membership and role are specific to this workspace.</p></div></div>
+            <div className="panel-heading"><div><h2>Members</h2><p>Membership and role are specific to this workspace.</p></div>{activeCompany?.is_owner && <button className="danger" type="button" onClick={deleteCompanyPermanently}>Delete company permanently</button>}</div>
             <form className="inline-form add-member-form" onSubmit={addMember}>
               <input type="email" placeholder="Invite by email address" value={memberEmail} onChange={(e) => setMemberEmail(e.target.value)} required />
               <select value={memberRole} onChange={(e) => setMemberRole(e.target.value as "member" | "viewer")}><option value="member">Member</option><option value="viewer">Viewer</option></select>
