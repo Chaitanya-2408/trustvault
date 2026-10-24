@@ -16,12 +16,16 @@ type JoinRequest = { id: number; email: string; role: string; created_at: string
 type InvitationInfo = { email: string; company_name: string; role: string };
 type Tab = "documents" | "members" | "audit";
 
+// Set VITE_API_BASE_URL in production (for example, the Render backend URL).
+// Locally, the empty default keeps using the Vite development proxy.
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+
 let csrfToken = "";
 async function getCsrfToken() {
   // Fetch a token for the current Flask session on every state-changing request.
   // Login OTP verification clears/rebuilds the session, so a cached token can
   // become stale and cause CSRF 400 responses for logout/member removal.
-  const response = await fetch("/csrf-token", { credentials: "include", cache: "no-store" });
+  const response = await fetch(`${API_BASE_URL}/csrf-token`, { credentials: "include", cache: "no-store" });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "Could not obtain CSRF token");
   csrfToken = data.csrf_token as string;
@@ -38,7 +42,7 @@ async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const response = await fetch(path, { ...init, headers, credentials: "include" });
+  const response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers, credentials: "include" });
   const type = response.headers.get("content-type") || "";
   const data = type.includes("application/json") ? await response.json() : null;
   if (!response.ok) throw new Error(data?.error || data?.description || `Request failed (${response.status})`);
@@ -277,7 +281,7 @@ function App() {
   async function downloadFile() {
     if (!selectedDoc) return;
     await runAction(async () => {
-      const response = await fetch(`/documents/${selectedDoc.id}/download`, { credentials: "include" });
+      const response = await fetch(`${API_BASE_URL}/documents/${selectedDoc.id}/download`, { credentials: "include" });
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
         throw new Error(data.error || `Download failed (${response.status})`);
@@ -419,7 +423,7 @@ function App() {
           <p className="muted">{authStep === "login-otp" ? `Enter the 6-digit code sent to ${email}.` : authStep === "forgot" ? "Enter your account email and we’ll send reset instructions if an account exists." : authStep === "reset" ? "Enter the code from your email and choose a strong new password." : "Share important files with confidence, clear permissions, and a verifiable audit trail."}</p>
           {authStep === "credentials" && <>
             <div className="auth-toggle"><button type="button" className={authMode === "login" ? "active" : ""} onClick={() => { setAuthMode("login"); setError(""); setMessage(""); }}>Sign in</button><button type="button" className={authMode === "register" ? "active" : ""} onClick={() => { setAuthMode("register"); setError(""); setMessage(""); }}>Create account</button></div>
-            <button className="secondary google-button" type="button" onClick={() => { window.location.href = "/auth/google"; }}>Continue with Google</button>
+            <button className="secondary google-button" type="button" onClick={() => { window.location.href = `${API_BASE_URL}/auth/google`; }}>Continue with Google</button>
             <p className="muted auth-separator">or continue with email</p>
             <form onSubmit={submitAuth} className="stack">
               <label>Email address<input type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} required placeholder="you@company.com" /></label>
