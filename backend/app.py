@@ -64,7 +64,10 @@ def create_app(test_config=None):
         ),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SAMESITE=os.environ.get(
+            "SESSION_COOKIE_SAMESITE",
+            "None" if os.environ.get("FRONTEND_URL", "").startswith("https://") else "Lax",
+        ),
         SESSION_COOKIE_SECURE=cookie_secure,
         REMEMBER_COOKIE_HTTPONLY=True,
         REMEMBER_COOKIE_SECURE=cookie_secure,
@@ -99,6 +102,36 @@ def create_app(test_config=None):
         app.config.update(test_config)
         if app.config.get("TESTING") and "MAIL_SUPPRESS_SEND" not in test_config:
             app.config["MAIL_SUPPRESS_SEND"] = True
+
+    # Cross-origin browser requests from the deployed frontend.
+    # Keep the allowlist limited to the configured frontend origin.
+    frontend_origin = app.config.get("FRONTEND_URL", "").rstrip("/")
+    if frontend_origin:
+        app.config["WTF_CSRF_TRUSTED_ORIGINS"] = list(
+            dict.fromkeys(
+                list(app.config.get("WTF_CSRF_TRUSTED_ORIGINS", []))
+                + [frontend_origin]
+            )
+        )
+
+    @app.after_request
+    def add_cors_headers(response):
+        origin = request.headers.get("Origin")
+        allowed_origin = app.config.get("FRONTEND_URL", "").rstrip("/")
+
+        if origin and allowed_origin and origin.rstrip("/") == allowed_origin:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Allow-Methods"] = (
+                "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+            )
+            response.headers["Access-Control-Allow-Headers"] = (
+                "Content-Type, X-CSRFToken, X-CSRF-Token"
+            )
+            response.headers["Access-Control-Expose-Headers"] = "Content-Disposition"
+            response.headers["Vary"] = "Origin"
+
+        return response
 
     if not app.config.get("SECRET_KEY"):
         raise RuntimeError(
