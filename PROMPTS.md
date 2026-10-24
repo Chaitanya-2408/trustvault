@@ -118,3 +118,30 @@
 **Validation:** Ran `python -m pytest -q`. Result: **27 passed in 3.98 seconds**.
 
 **Learning:** Company membership must be checked in addition to document permissions. A user from another company should not gain access simply because a document permission exists.
+
+
+### Entry 10 — SMTP email configuration and workspace invitation troubleshooting
+
+**Date:** 24 October 2026
+
+**Prompt:** Help me troubleshoot TrustVault's Flask email invitation flow, identify why email delivery was being skipped due to the `MAIL_SUPPRESS_SEND` configuration, verify the application's environment settings, and confirm successful SMTP email delivery without exposing credentials.
+
+**Work completed:** Investigated the HTTP 503 response from the `/admin/members` endpoint. Checked the `.env` configuration and PowerShell environment variables, verified that `TESTING` was `False` and `MAIL_SUPPRESS_SEND` was `False`, and improved email error logging to identify the cause of delivery failures. Restarted Flask and successfully tested sending an invitation email.
+
+**Validation:** Confirmed that the invitation email was received and the invited user was able to join the workspace.
+
+**Learning:** Environment variables can override values loaded from `.env`. Verifying the effective Flask configuration and logging SMTP exceptions helps diagnose email delivery failures without exposing sensitive credentials.
+
+---
+
+### Entry 11 — Google OAuth configuration handling and backend test fixes
+
+**Date:** 24 October 2026
+
+**Prompt:** Help me fix the failing TrustVault test for Google login when OAuth credentials are missing, ensure the login endpoint reports a configuration error instead of redirecting to Google's authorization page, and validate the changes without weakening authentication security.
+
+**Work completed:** Investigated `test_google_login_reports_missing_configuration` and identified that the Google OAuth client could remain registered even after the test cleared the configured credentials. Updated the `/auth/google` route to check the current `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` values before attempting OAuth authorization.
+
+**Validation:** Ran `python -m pytest -q`. Result: **35 passed in 13.23 seconds**. Also ran `npm run build` successfully, confirming that TypeScript compilation and the Vite production build completed without errors.
+
+**Learning:** OAuth configuration should be validated using the application's current settings before initiating authorization. Tests should verify missing-credential handling while preserving the normal Google sign-in flow when valid credentials are configured.

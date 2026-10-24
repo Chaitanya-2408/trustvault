@@ -1,8 +1,11 @@
 import os
 import secrets
+import hashlib
+from datetime import datetime, timedelta
+from urllib.parse import urlencode
 from pathlib import Path
 
-from flask import send_file
+from flask import send_file, redirect, url_for
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 
@@ -18,8 +21,10 @@ from flask_login import (
 )
 from flask_wtf.csrf import CSRFError, generate_csrf
 from sqlalchemy.exc import IntegrityError
+from authlib.integrations.flask_client import OAuth
 
 from backend.audit import log_audit_event
+from backend.email_service import send_email
 from backend.extensions import csrf, db, login_manager, migrate
 from backend.models import (
     AuditLog,
@@ -28,6 +33,8 @@ from backend.models import (
     Document,
     DocumentPermission,
     User,
+    WorkspaceInvitation,
+    WorkspaceJoinRequest,
 )
 
 load_dotenv()
@@ -77,11 +84,19 @@ def create_app(test_config=None):
         MAIL_SUPPRESS_SEND=os.environ.get(
             "MAIL_SUPPRESS_SEND", "false"
         ).lower() == "true",
+        GOOGLE_CLIENT_ID=os.environ.get("GOOGLE_CLIENT_ID", ""),
+        GOOGLE_CLIENT_SECRET=os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+        FRONTEND_URL=os.environ.get("FRONTEND_URL", "http://localhost:5173"),
+        BACKEND_URL=os.environ.get("BACKEND_URL", "http://localhost:5000"),
+        INVITATION_TTL_HOURS=int(os.environ.get("INVITATION_TTL_HOURS", "48")),
+        JOIN_REQUEST_TTL_HOURS=int(os.environ.get("JOIN_REQUEST_TTL_HOURS", "72")),
 
     )
 
     if test_config:
         app.config.update(test_config)
+        if app.config.get("TESTING") and "MAIL_SUPPRESS_SEND" not in test_config:
+            app.config["MAIL_SUPPRESS_SEND"] = True
 
     if not app.config.get("SECRET_KEY"):
         raise RuntimeError(
@@ -92,6 +107,16 @@ def create_app(test_config=None):
     login_manager.init_app(app)
     csrf.init_app(app)
     migrate.init_app(app, db)
+
+    oauth = OAuth(app)
+    if app.config.get("GOOGLE_CLIENT_ID") and app.config.get("GOOGLE_CLIENT_SECRET"):
+        oauth.register(
+            name="google",
+            client_id=app.config["GOOGLE_CLIENT_ID"],
+            client_secret=app.config["GOOGLE_CLIENT_SECRET"],
+            server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+            client_kwargs={"scope": "openid email profile"},
+        )
 
     @login_manager.unauthorized_handler
     def unauthorized():
@@ -128,74 +153,147 @@ def create_app(test_config=None):
     # ---------------- Authentication ----------------
 
 
+    def _normalized_company_name(value):
+        return " ".join((value or "").split()).casefold()
+
+    def _find_company_by_name(name):
+        normalized = _normalized_company_name(name)
+        if not normalized:
+            return None
+        # The unique normalized_name index is the final concurrency-safe guard.
+        # Older duplicate records are retained but their normalized_name values are
+        # disambiguated by the migration; new requests resolve to the canonical row.
+        return db.session.execute(
+            db.select(Company).filter_by(normalized_name=normalized).order_by(Company.id.asc())
+        ).scalars().first()
+
+    def _token_digest(token):
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _new_token():
+        return secrets.token_urlsafe(32)
+
+    def _frontend_link(path, token=None):
+        base = app.config.get("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+        query = urlencode({"token": token}) if token else ""
+        return f"{base}/{path.lstrip('/')}" + (f"?{query}" if query else "")
+
+    
+    def _send_email_safely(to_address, subject, body):
+        if app.config.get("MAIL_SUPPRESS_SEND"):
+            app.logger.error(
+                "Email sending skipped: MAIL_SUPPRESS_SEND is enabled."
+            )
+            return False
+
+        try:
+            send_email(to_address, subject, body)
+            app.logger.info("Email sent successfully to %s", to_address)
+            return True
+        except Exception:
+            app.logger.exception(
+                "TrustVault email delivery failed. Check the traceback above."
+            )
+            return False
+
+
+    def _notify_company_admins(company, subject, body):
+        rows = db.session.execute(
+            db.select(User.email)
+            .join(CompanyMembership, CompanyMembership.user_id == User.id)
+            .where(CompanyMembership.company_id == company.id, CompanyMembership.role == "admin")
+        ).scalars().all()
+        delivered = True
+        for admin_email in set(rows):
+            delivered = _send_email_safely(admin_email, subject, body) and delivered
+        return delivered
+
+    def _create_join_request(company, email):
+        request_row = db.session.execute(
+            db.select(WorkspaceJoinRequest).where(
+                WorkspaceJoinRequest.company_id == company.id,
+                db.func.lower(WorkspaceJoinRequest.requester_email) == email,
+                WorkspaceJoinRequest.status == "pending",
+                WorkspaceJoinRequest.expires_at > datetime.utcnow(),
+            )
+        ).scalar_one_or_none()
+        if request_row is None:
+            request_row = WorkspaceJoinRequest(
+                company_id=company.id,
+                requester_email=email,
+                requested_role="admin",
+                expires_at=datetime.utcnow() + timedelta(hours=app.config["JOIN_REQUEST_TTL_HOURS"]),
+            )
+            db.session.add(request_row)
+            db.session.flush()
+            log_audit_event(
+                action="WORKSPACE_ADMIN_REQUESTED",
+                outcome="SUCCESS",
+                actor_user_id=None,
+                actor_email=email,
+                company_id=company.id,
+                details={"request_id": request_row.id, "requested_role": "admin"},
+                commit=False,
+            )
+            db.session.commit()
+        # Retrying the same pending request also retries the notification, which is
+        # useful if SMTP was not configured when the applicant first submitted it.
+        link = _frontend_link("/")
+        body = (
+            f"A request was made for {email} to become an administrator of {company.name}.\n\n"
+            f"Sign in to TrustVault as a workspace administrator, open Members, and review Pending administrator requests.\n\n"
+            f"Request ID: {request_row.id}\nReview: {link}\n\n"
+            "If you did not expect this request, you can reject it. Company names alone do not grant access."
+        )
+        sent = _notify_company_admins(company, "TrustVault administrator approval requested", body)
+        return request_row, sent
+
     @app.post("/register")
     def register():
         data = request.get_json(silent=True)
-
         if not isinstance(data, dict):
             return jsonify({"error": "A JSON object is required"}), 400
-
         email = data.get("email", "")
         password = data.get("password", "")
         company_name = data.get("company_name", "")
-
-        if not isinstance(email, str) or not isinstance(password, str):
-            return jsonify({
-                "error": "Email and password must be strings"
-            }), 400
-
-        if not isinstance(company_name, str):
-            return jsonify({
-                "error": "Company name must be a string"
-            }), 400
-
+        if not all(isinstance(v, str) for v in (email, password, company_name)):
+            return jsonify({"error": "Email, password, and company name must be strings"}), 400
         email = email.strip().lower()
-        company_name = company_name.strip()
-
-        if (
-            not email
-            or len(email) > 255
-            or "@" not in email
-            or email.startswith("@")
-            or email.endswith("@")
-        ):
+        company_name = " ".join(company_name.split())
+        if not email or len(email) > 255 or "@" not in email or email.startswith("@") or email.endswith("@"):
             return jsonify({"error": "A valid email is required"}), 400
-
         if len(password) < 12:
-            return jsonify({
-                "error": "Password must be at least 12 characters"
-            }), 400
-
+            return jsonify({"error": "Password must be at least 12 characters"}), 400
         if not company_name or len(company_name) > 200:
+            return jsonify({"error": "Company name must be between 1 and 200 characters"}), 400
+        existing_user = db.session.execute(db.select(User).filter_by(email=email)).scalar_one_or_none()
+        if existing_user is not None:
+            return jsonify({"error": "An account with that email already exists. Please sign in."}), 409
+        company = _find_company_by_name(company_name)
+        if company is not None:
+            try:
+                join_request, email_sent = _create_join_request(company, email)
+            except Exception:
+                db.session.rollback()
+                app.logger.exception("Could not create workspace administrator request")
+                return jsonify({"error": "Could not submit the administrator request"}), 500
             return jsonify({
-                "error": "Company name must be between 1 and 200 characters"
-            }), 400
-
+                "message": "This company already exists. Its administrators must approve your administrator request before you can join.",
+                "request_id": join_request.id,
+                "status": "pending",
+                "notification_sent": bool(email_sent),
+            }), 202
         user = User(email=email, role="viewer")
         user.set_password(password)
-
         company = Company(name=company_name)
-
-        # The workspace creator becomes its first company administrator.
-        membership = CompanyMembership(
-            company=company,
-            user=user,
-            role="admin",
-        )
-
+        membership = CompanyMembership(company=company, user=user, role="admin")
         db.session.add_all([user, company, membership])
-
         try:
-            # Create all three records in one transaction.
             db.session.commit()
         except IntegrityError:
             db.session.rollback()
-            return jsonify({
-                "error": "An account with that email already exists"
-            }), 409
-
-        return jsonify({"message": "Account created"}), 201
-
+            return jsonify({"error": "An account or workspace with that information already exists; please try again."}), 409
+        return jsonify({"message": "Account created", "workspace_role": "admin"}), 201
 
     @app.post("/login")
     def login():
@@ -238,6 +336,99 @@ def create_app(test_config=None):
             "role": user.role,
             "active_company_id": session.get("active_company_id"),
         }), 200
+
+    
+    @app.get("/auth/google")
+    def google_login():
+        if (
+        not app.config.get("GOOGLE_CLIENT_ID")
+        or not app.config.get("GOOGLE_CLIENT_SECRET")
+        ):
+            return redirect(
+            app.config["FRONTEND_URL"].rstrip("/")
+            + "/?oauth_error=not_configured"
+            )
+
+        google = oauth.create_client("google")
+        if google is None:
+            return redirect(
+            app.config["FRONTEND_URL"].rstrip("/")
+            + "/?oauth_error=not_configured"
+            )
+
+        callback = (
+            app.config["BACKEND_URL"].rstrip("/")
+            + "/auth/google/callback"
+        )
+        return google.authorize_redirect(callback)
+
+
+    @app.get("/auth/google/callback")
+    def google_callback():
+        google = oauth.create_client("google")
+        if google is None:
+            return redirect(app.config["FRONTEND_URL"].rstrip("/") + "/?oauth_error=not_configured")
+        try:
+            token = google.authorize_access_token()
+            info = token.get("userinfo")
+            if not info:
+                userinfo_response = google.userinfo()
+                info = userinfo_response.json() if hasattr(userinfo_response, "json") else userinfo_response
+        except Exception:
+            app.logger.exception("Google OAuth callback failed")
+            return redirect(app.config["FRONTEND_URL"].rstrip("/") + "/?oauth_error=sign_in_failed")
+        email = (info.get("email") or "").strip().lower()
+        verified = info.get("email_verified") is True or str(info.get("email_verified", "")).lower() == "true"
+        if not email or not verified:
+            return redirect(app.config["FRONTEND_URL"].rstrip("/") + "/?oauth_error=email_not_verified")
+        user = db.session.execute(db.select(User).filter_by(email=email)).scalar_one_or_none()
+        if user is None:
+            user = User(email=email, password_hash=None, role="viewer")
+            db.session.add(user)
+            try:
+                db.session.commit()
+            except IntegrityError:
+                db.session.rollback()
+                user = db.session.execute(db.select(User).filter_by(email=email)).scalar_one_or_none()
+                if user is None:
+                    return redirect(app.config["FRONTEND_URL"].rstrip("/") + "/?oauth_error=account_failed")
+        login_user(user)
+        session.pop("active_company_id", None)
+        memberships = db.session.execute(db.select(CompanyMembership).filter_by(user_id=user.id)).scalars().all()
+        if len(memberships) == 1:
+            session["active_company_id"] = memberships[0].company_id
+        target = app.config["FRONTEND_URL"].rstrip("/") + "/?oauth=success"
+        if not memberships:
+            target += "&setup_workspace=1"
+        return redirect(target)
+
+    @app.post("/companies")
+    @login_required
+    def create_or_request_workspace():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or not isinstance(data.get("name"), str):
+            return jsonify({"error": "A workspace name is required"}), 400
+        name = " ".join(data["name"].split())
+        if not name or len(name) > 200:
+            return jsonify({"error": "Workspace name must be between 1 and 200 characters"}), 400
+        existing_memberships = db.session.execute(db.select(CompanyMembership).filter_by(user_id=current_user.id)).scalars().all()
+        if existing_memberships:
+            return jsonify({"error": "This account already belongs to a workspace. Ask an administrator to invite you to another workspace."}), 409
+        company = _find_company_by_name(name)
+        if company is not None:
+            join_request, email_sent = _create_join_request(company, current_user.email)
+            return jsonify({"message": "Company exists. Administrator approval is required.", "status": "pending", "request_id": join_request.id, "notification_sent": bool(email_sent)}), 202
+        company = Company(name=name)
+        membership = CompanyMembership(company=company, user_id=current_user.id, role="admin")
+        db.session.add_all([company, membership])
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify({"error": "Could not create workspace. Please retry."}), 409
+        session["active_company_id"] = company.id
+        log_audit_event(action="WORKSPACE_CREATED", outcome="SUCCESS", actor_user_id=current_user.id, actor_email=current_user.email, company_id=company.id, details={"company_name": company.name})
+        return jsonify({"message": "Workspace created", "company_id": company.id, "company_name": company.name, "workspace_role": "admin"}), 201
 
     @app.post("/logout")
     @login_required
@@ -410,7 +601,7 @@ def create_app(test_config=None):
             return None
 
         if document.owner_id == current_user.id:
-            return "OWNER"
+            return "READ" if active_membership.role == "viewer" else "OWNER"
 
         grant = db.session.execute(
             db.select(DocumentPermission).filter_by(
@@ -418,8 +609,12 @@ def create_app(test_config=None):
                 user_id=current_user.id,
             )
         ).scalar_one_or_none()
-
-        return grant.permission_level if grant else None
+        if grant is None:
+            return None
+        # Workspace viewers can never elevate themselves with an EDIT document grant.
+        if active_membership.role == "viewer":
+            return "READ"
+        return grant.permission_level
 
 
     def document_or_404(document_id):
@@ -469,6 +664,8 @@ def create_app(test_config=None):
             return jsonify({
                 "error": "A single active company workspace is required"
             }), 403
+        if membership.role == "viewer":
+            return jsonify({"error": "Viewer role cannot create documents"}), 403
 
         if not valid_text(title, 255):
             return jsonify({"error": "A valid title is required"}), 400
@@ -1127,84 +1324,182 @@ def create_app(test_config=None):
     @app.post("/admin/members")
     @admin_required
     def add_workspace_member():
-        """Add an existing account with no workspace to this workspace.
-
-        This endpoint intentionally does not create accounts or expose public
-        workspace-join links. Only an authenticated workspace admin can add a
-        registered account. Existing accounts may join multiple workspaces;
-        their other memberships and per-workspace roles are not changed.
-        """
+        """Invite an email address to the active workspace."""
         membership = current_company_membership()
         if membership is None:
             return jsonify({"error": "A single active company workspace is required"}), 403
-
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
             return jsonify({"error": "A JSON object is required"}), 400
-
         email = data.get("email")
+        role = data.get("role", "member")
         if not isinstance(email, str) or not email.strip() or len(email.strip()) > 255 or "@" not in email:
             return jsonify({"error": "A valid email is required"}), 400
         email = email.strip().lower()
-
-        target = db.session.execute(
-            db.select(User).filter_by(email=email)
-        ).scalar_one_or_none()
-        if target is None:
-            log_audit_event(
-                action="WORKSPACE_MEMBER_ADD",
-                outcome="DENIED",
-                actor_user_id=current_user.id,
-                actor_email=current_user.email,
-                target_user_id=None,
-                company_id=membership.company_id,
-                details={"reason": "target_account_not_found", "target_email": email},
-            )
-            return jsonify({"error": "Register this account before adding it to the workspace"}), 404
-
-        if target.id == current_user.id:
+        if role not in ("member", "viewer"):
+            return jsonify({"error": "Invitations can assign the Member or Viewer role. Administrator access requires an approval request."}), 400
+        if email == current_user.email:
             return jsonify({"error": "You are already a workspace member"}), 409
-
-        existing_membership = db.session.execute(
-            db.select(CompanyMembership).filter_by(
-                user_id=target.id,
-                company_id=membership.company_id,
-            )
-        ).scalar_one_or_none()
-        if existing_membership is not None:
-            return jsonify({"error": "This user is already a member of this workspace"}), 409
-
-        # A registered account may belong to multiple workspaces. Membership and
-        # role are independent per workspace; adding it here does not move or
-        # alter the user's other memberships.
-        new_membership = CompanyMembership(
-            company_id=membership.company_id,
-            user_id=target.id,
-            role="member",
-        )
-        db.session.add(new_membership)
-        log_audit_event(
-            action="WORKSPACE_MEMBER_ADDED",
-            outcome="SUCCESS",
-            actor_user_id=current_user.id,
-            actor_email=current_user.email,
-            target_user_id=target.id,
-            company_id=membership.company_id,
-            details={"workspace_id": membership.company_id, "target_email": email},
-            commit=False,
-        )
-        try:
+        target = db.session.execute(db.select(User).filter_by(email=email)).scalar_one_or_none()
+        if target is not None:
+            existing = db.session.execute(db.select(CompanyMembership).filter_by(user_id=target.id, company_id=membership.company_id)).scalar_one_or_none()
+            if existing is not None:
+                return jsonify({"error": "This user is already a member of this workspace"}), 409
+            db.session.add(CompanyMembership(company_id=membership.company_id, user_id=target.id, role=role))
+            log_audit_event(action="WORKSPACE_MEMBER_ADDED", outcome="SUCCESS", actor_user_id=current_user.id, actor_email=current_user.email, target_user_id=target.id, company_id=membership.company_id, details={"target_email": email, "role": role}, commit=False)
             db.session.commit()
-        except IntegrityError:
-            db.session.rollback()
-            return jsonify({"error": "Could not add this account to the workspace"}), 409
+            company = db.session.get(Company, membership.company_id)
+            sent = _send_email_safely(email, f"You were added to {company.name} on TrustVault", f"An administrator added your account to the {company.name} workspace as {role}. Sign in to TrustVault to continue.")
+            return jsonify({"message": "Existing account added to workspace", "user_id": target.id, "email": email, "workspace_role": role, "notification_sent": bool(sent)}), 201
 
-        return jsonify({
-            "message": "Workspace member added",
-            "user_id": target.id,
-            "email": target.email,
-            "workspace_role": "member",
-        }), 201
+        token = _new_token()
+        invitation = WorkspaceInvitation(
+            company_id=membership.company_id,
+            email=email,
+            role=role,
+            token_hash=_token_digest(token),
+            invited_by_user_id=current_user.id,
+            expires_at=datetime.utcnow() + timedelta(hours=app.config["INVITATION_TTL_HOURS"]),
+        )
+        db.session.add(invitation)
+        db.session.commit()
+        company = db.session.get(Company, membership.company_id)
+        link = _frontend_link("", token)
+        sent = _send_email_safely(email, f"Invitation to join {company.name} on TrustVault", f"You have been invited to join {company.name} on TrustVault as a {role}.\n\nUse this one-time link within {app.config['INVITATION_TTL_HOURS']} hours to set your password and activate your account:\n{link}\n\nIf you were not expecting this invitation, you can ignore this email.")
+        if not sent:
+            db.session.delete(invitation)
+            db.session.commit()
+            return jsonify({"error": "Email was not delivered. Configure SMTP and ensure MAIL_SUPPRESS_SEND=false, then try again."}), 503
+        log_audit_event(action="WORKSPACE_INVITATION_SENT", outcome="SUCCESS", actor_user_id=current_user.id, actor_email=current_user.email, company_id=membership.company_id, details={"target_email": email, "role": role})
+        return jsonify({"message": "Invitation sent", "email": email, "workspace_role": role, "notification_sent": bool(sent)}), 201
+
+    @app.get("/invites/validate")
+    def validate_invitation():
+        token = request.args.get("token", "")
+        if not token or len(token) > 256:
+            return jsonify({"error": "A valid invitation token is required"}), 400
+        invitation = db.session.execute(db.select(WorkspaceInvitation).filter_by(token_hash=_token_digest(token))).scalar_one_or_none()
+        if invitation is None or invitation.accepted_at is not None or invitation.revoked_at is not None or invitation.expires_at <= datetime.utcnow():
+            return jsonify({"error": "This invitation is invalid, expired, or already used"}), 410
+        company = db.session.get(Company, invitation.company_id)
+        return jsonify({"email": invitation.email, "company_name": company.name if company else "Workspace", "role": invitation.role}), 200
+
+    @app.post("/invites/accept")
+    def accept_invitation():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "A JSON object is required"}), 400
+        token = data.get("token", "")
+        password = data.get("password", "")
+        if not isinstance(token, str) or not token or not isinstance(password, str) or len(password) < 12:
+            return jsonify({"error": "A valid invitation token and password of at least 12 characters are required"}), 400
+        invitation = db.session.execute(db.select(WorkspaceInvitation).filter_by(token_hash=_token_digest(token))).scalar_one_or_none()
+        if invitation is None or invitation.accepted_at is not None or invitation.revoked_at is not None or invitation.expires_at <= datetime.utcnow():
+            return jsonify({"error": "This invitation is invalid, expired, or already used"}), 410
+        user = db.session.execute(db.select(User).filter_by(email=invitation.email)).scalar_one_or_none()
+        if user is None:
+            user = User(email=invitation.email, role="viewer")
+            user.set_password(password)
+            db.session.add(user)
+            db.session.flush()
+        elif not user.password_hash:
+            user.set_password(password)
+        existing = db.session.execute(db.select(CompanyMembership).filter_by(user_id=user.id, company_id=invitation.company_id)).scalar_one_or_none()
+        if existing is None:
+            db.session.add(CompanyMembership(user_id=user.id, company_id=invitation.company_id, role=invitation.role))
+        elif existing.role != invitation.role:
+            existing.role = invitation.role
+        invitation.accepted_at = datetime.utcnow()
+        log_audit_event(action="WORKSPACE_INVITATION_ACCEPTED", outcome="SUCCESS", actor_user_id=user.id, actor_email=user.email, company_id=invitation.company_id, details={"role": invitation.role}, commit=False)
+        db.session.commit()
+        login_user(user)
+        session["active_company_id"] = invitation.company_id
+        return jsonify({"message": "Invitation accepted", "email": user.email, "active_company_id": invitation.company_id}), 200
+
+    @app.delete("/admin/members/<int:user_id>")
+    @admin_required
+    def remove_workspace_member(user_id):
+        membership = current_company_membership()
+        if membership is None:
+            return jsonify({"error": "A single active company workspace is required"}), 403
+        if user_id == current_user.id:
+            return jsonify({"error": "You cannot remove your own administrator membership"}), 409
+        target_membership = db.session.execute(db.select(CompanyMembership).filter_by(user_id=user_id, company_id=membership.company_id)).scalar_one_or_none()
+        if target_membership is None:
+            return jsonify({"error": "Workspace member not found"}), 404
+        if target_membership.role == "admin":
+            admin_count = db.session.execute(db.select(db.func.count(CompanyMembership.id)).filter_by(company_id=membership.company_id, role="admin")).scalar_one()
+            if admin_count <= 1:
+                return jsonify({"error": "The last workspace administrator cannot be removed"}), 409
+        target = db.session.get(User, user_id)
+        email = target.email if target else None
+        # Remove only this workspace membership and its grants; never delete the account.
+        workspace_doc_ids = db.select(Document.id).where(Document.company_id == membership.company_id)
+        db.session.execute(db.delete(DocumentPermission).where(DocumentPermission.user_id == user_id, DocumentPermission.document_id.in_(workspace_doc_ids)))
+        db.session.delete(target_membership)
+        log_audit_event(action="WORKSPACE_MEMBER_REMOVED", outcome="SUCCESS", actor_user_id=current_user.id, actor_email=current_user.email, target_user_id=user_id, company_id=membership.company_id, details={"target_email": email}, commit=False)
+        db.session.commit()
+        return jsonify({"message": "Workspace access removed", "user_id": user_id, "email": email}), 200
+
+    @app.get("/admin/join-requests")
+    @admin_required
+    def list_join_requests():
+        membership = current_company_membership()
+        rows = db.session.execute(db.select(WorkspaceJoinRequest).where(WorkspaceJoinRequest.company_id == membership.company_id, WorkspaceJoinRequest.status == "pending", WorkspaceJoinRequest.expires_at > datetime.utcnow()).order_by(WorkspaceJoinRequest.created_at.asc())).scalars().all()
+        return jsonify({"requests": [{"id": row.id, "email": row.requester_email, "role": row.requested_role, "created_at": row.created_at.isoformat(), "expires_at": row.expires_at.isoformat()} for row in rows]}), 200
+
+    @app.post("/admin/join-requests/<int:request_id>/decision")
+    @admin_required
+    def decide_join_request(request_id):
+        membership = current_company_membership()
+        data = request.get_json(silent=True)
+        decision = data.get("decision") if isinstance(data, dict) else None
+        if decision not in ("approve", "reject"):
+            return jsonify({"error": "decision must be approve or reject"}), 400
+        row = db.session.get(WorkspaceJoinRequest, request_id)
+        if row is None or row.company_id != membership.company_id:
+            return jsonify({"error": "Join request not found"}), 404
+        if row.status != "pending" or row.expires_at <= datetime.utcnow():
+            return jsonify({"error": "This request is no longer pending or has expired"}), 409
+        company = db.session.get(Company, row.company_id)
+        target = db.session.execute(db.select(User).filter_by(email=row.requester_email)).scalar_one_or_none()
+        invite = None
+        invite_token = None
+        if decision == "approve":
+            if target is not None:
+                existing = db.session.execute(db.select(CompanyMembership).filter_by(user_id=target.id, company_id=company.id)).scalar_one_or_none()
+                if existing is None:
+                    db.session.add(CompanyMembership(user_id=target.id, company_id=company.id, role="admin"))
+                else:
+                    existing.role = "admin"
+            else:
+                invite_token = _new_token()
+                invite = WorkspaceInvitation(company_id=company.id, email=row.requester_email, role="admin", token_hash=_token_digest(invite_token), invited_by_user_id=current_user.id, expires_at=datetime.utcnow() + timedelta(hours=app.config["INVITATION_TTL_HOURS"]))
+                db.session.add(invite)
+            row.status = "approved"
+        else:
+            row.status = "rejected"
+        row.decided_at = datetime.utcnow()
+        row.decided_by_user_id = current_user.id
+        log_audit_event(action="WORKSPACE_ADMIN_REQUEST_" + decision.upper(), outcome="SUCCESS", actor_user_id=current_user.id, actor_email=current_user.email, target_user_id=target.id if target else None, company_id=company.id, details={"request_id": row.id, "requester_email": row.requester_email}, commit=False)
+        db.session.commit()
+        if decision == "reject":
+            sent = _send_email_safely(row.requester_email, f"TrustVault request for {company.name}", f"Your request to become an administrator of {company.name} was not approved. Contact the company administrator if you believe this was a mistake.")
+        elif target is not None:
+            sent = _send_email_safely(row.requester_email, f"Your {company.name} request was approved", f"Your request to become an administrator of {company.name} was approved. Sign in to TrustVault using your existing account. If you registered with Google, continue with Google.")
+        else:
+            link = _frontend_link("", invite_token)
+            sent = _send_email_safely(row.requester_email, f"Set up your TrustVault administrator account for {company.name}", f"Your request to become an administrator of {company.name} was approved. Use this one-time link within {app.config['INVITATION_TTL_HOURS']} hours to set your password and activate your account:\n{link}")
+        if not sent and decision == "approve" and target is None and invite is not None:
+            db.session.delete(invite)
+            row.status = "pending"
+            row.decided_at = None
+            row.decided_by_user_id = None
+            db.session.commit()
+            return jsonify({"error": "Approval could not be completed because the setup email was not delivered. Configure SMTP and try again."}), 503
+        if not sent:
+            return jsonify({"message": f"Request {decision}d, but the notification email was not delivered. Check SMTP configuration.", "decision": decision, "notification_sent": False}), 200
+        return jsonify({"message": f"Request {decision}d and notification email sent", "decision": decision, "notification_sent": True}), 200
 
     # ---------------- Admin audit history ----------------
 

@@ -61,3 +61,18 @@ All request/response bodies are JSON unless the route uploads or downloads a fil
 ## Audit fields
 
 Audit responses include event ID, actor snapshot, action, outcome (`SUCCESS` or `DENIED`), document ID, target user ID, safe metadata, timestamp, previous hash, and event hash. Do not put document contents, passwords, session cookies, CSRF tokens, or secrets in audit details.
+
+
+## Identity and workspace onboarding endpoints
+
+- `GET /auth/google` — begin Google OpenID Connect sign-in (requires Google OAuth credentials).
+- `GET /auth/google/callback` — OAuth callback.
+- `POST /companies` — create the first workspace for a newly authenticated Google user, or request approval to join an existing company when no workspace membership exists.
+- `POST /admin/members` — add an existing account or email an invitation to a new account. Accepts `email` and `role` (`member` or `viewer`).
+- `GET /invites/validate?token=...` — validate a pending invitation.
+- `POST /invites/accept` — accept an invitation and set an initial password.
+- `DELETE /admin/members/<user_id>` — remove a user's membership from the active workspace without deleting the account.
+- `GET /admin/join-requests` — list pending requests to become a workspace administrator.
+- `POST /admin/join-requests/<request_id>/decision` — approve or reject a request using `{"decision":"approve"}` or `{"decision":"reject"}`.
+
+All state-changing endpoints remain subject to the application's CSRF protection. Administrator endpoints require an active workspace administrator session.

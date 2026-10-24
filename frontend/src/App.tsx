@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
-type Company = { id: number; name: string; role: "admin" | "member"; active?: boolean };
+type Company = { id: number; name: string; role: "admin" | "member" | "viewer"; active?: boolean };
 type User = { id: number; email: string; role: string; active_company_id: number | null; companies: Company[] };
 type DocumentItem = {
   id: number; title: string; category: string; description: string; owner_id: number;
@@ -12,6 +12,8 @@ type AuditEvent = {
   document_id: number | null; created_at: string; details: Record<string, unknown>;
 };
 type Member = { user_id: number; email: string; workspace_role: string; joined_at: string };
+type JoinRequest = { id: number; email: string; role: string; created_at: string; expires_at: string };
+type InvitationInfo = { email: string; company_name: string; role: string };
 type Tab = "documents" | "members" | "audit";
 
 let csrfToken = "";
@@ -63,6 +65,12 @@ function App() {
   const [grantLevel, setGrantLevel] = useState<"READ" | "EDIT">("READ");
   const [revokeUserId, setRevokeUserId] = useState("");
   const [memberEmail, setMemberEmail] = useState("");
+  const [memberRole, setMemberRole] = useState<"member" | "viewer">("member");
+  const [joinRequests, setJoinRequests] = useState<JoinRequest[]>([]);
+  const [inviteToken, setInviteToken] = useState(() => new URLSearchParams(window.location.search).get("token") || "");
+  const [inviteInfo, setInviteInfo] = useState<InvitationInfo | null>(null);
+  const [invitePassword, setInvitePassword] = useState("");
+  const [workspaceRequestPending, setWorkspaceRequestPending] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -91,6 +99,20 @@ function App() {
   }, [activeCompanyId, titleFilter, categoryFilter]);
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("oauth") === "success") setMessage("Google sign-in successful.");
+    if (params.get("oauth_error")) setError(`Google sign-in could not complete: ${params.get("oauth_error")}. You can still use email and password.`);
+    if (inviteToken) {
+      api<InvitationInfo>(`/invites/validate?token=${encodeURIComponent(inviteToken)}`)
+        .then(setInviteInfo)
+        .catch((e: Error) => setError(e.message));
+    }
+    if (params.has("oauth") || params.has("oauth_error") || params.has("setup_workspace")) {
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, [inviteToken]);
+
+  useEffect(() => {
     api<User>("/me").then((me) => {
       setUser(me); setCompanies(me.companies || []); setActiveCompanyId(me.active_company_id);
     }).catch(() => setUser(null));
@@ -107,16 +129,19 @@ function App() {
 
   useEffect(() => {
     if (!user || !activeCompanyId || tab === "documents") return;
-    if (tab === "members") {
+    if (tab === "members" && activeCompany?.role === "admin") {
       api<{ members: Member[] }>("/admin/members")
         .then((result) => setMembers(result.members))
         .catch((e: Error) => setError(e.message));
-    } else {
+      api<{ requests: JoinRequest[] }>("/admin/join-requests")
+        .then((result) => setJoinRequests(result.requests))
+        .catch((e: Error) => setError(e.message));
+    } else if (tab === "audit" && activeCompany?.role === "admin") {
       api<{ events: AuditEvent[] }>("/admin/audit-logs?page=1&per_page=100")
         .then((result) => setAuditEvents(result.events))
         .catch((e: Error) => setError(e.message));
     }
-  }, [user, activeCompanyId, tab]);
+  }, [user, activeCompanyId, tab, activeCompany?.role]);
 
   async function runAction(action: () => Promise<void>) {
     setBusy(true); setError(""); setMessage("");
@@ -128,8 +153,8 @@ function App() {
     event.preventDefault();
     await runAction(async () => {
       if (authMode === "register") {
-        await api("/register", { method: "POST", body: JSON.stringify({ email, password, company_name: companyName }) });
-        setMessage("Account created. Sign in with your new account.");
+        const result = await api<{ message: string; status?: string; notification_sent?: boolean }>("/register", { method: "POST", body: JSON.stringify({ email, password, company_name: companyName }) });
+        setMessage(result.notification_sent === false ? `${result.message} Email notification was not delivered; the administrator must be contacted until SMTP is configured.` : (result.message || "Registration request submitted."));
         setAuthMode("login");
         setPassword("");
         return;
@@ -261,13 +286,69 @@ function App() {
   async function addMember(event: FormEvent) {
     event.preventDefault();
     await runAction(async () => {
-      await api("/admin/members", { method: "POST", body: JSON.stringify({ email: memberEmail }) });
+      const result = await api<{ message: string }>("/admin/members", { method: "POST", body: JSON.stringify({ email: memberEmail, role: memberRole }) });
       setMemberEmail("");
-      const result = await api<{ members: Member[] }>("/admin/members");
-      setMembers(result.members);
-      await refreshMe();
-      setMessage("Workspace member added.");
+      const membersResult = await api<{ members: Member[] }>("/admin/members");
+      setMembers(membersResult.members);
+      setMessage(result.message || "Invitation sent.");
     });
+  }
+
+  async function removeMember(member: Member) {
+    if (!window.confirm(`Remove ${member.email} from this workspace? Their account and other workspace memberships will remain.`)) return;
+    await runAction(async () => {
+      await api(`/admin/members/${member.user_id}`, { method: "DELETE", body: JSON.stringify({}) });
+      setMembers((current) => current.filter((item) => item.user_id !== member.user_id));
+      setMessage(`${member.email} was removed from this workspace.`);
+    });
+  }
+
+  async function decideJoinRequest(requestId: number, decision: "approve" | "reject") {
+    if (!window.confirm(`${decision === "approve" ? "Approve" : "Reject"} this administrator request?`)) return;
+    await runAction(async () => {
+      const result = await api<{ message: string }>(`/admin/join-requests/${requestId}/decision`, { method: "POST", body: JSON.stringify({ decision }) });
+      setJoinRequests((current) => current.filter((item) => item.id !== requestId));
+      setMessage(result.message);
+    });
+  }
+
+  async function acceptInvitation(event: FormEvent) {
+    event.preventDefault();
+    await runAction(async () => {
+      await api("/invites/accept", { method: "POST", body: JSON.stringify({ token: inviteToken, password: invitePassword }) });
+      setInviteToken(""); setInviteInfo(null); setInvitePassword("");
+      window.history.replaceState({}, document.title, window.location.pathname);
+      await refreshMe();
+      setMessage("Invitation accepted. Welcome to TrustVault!");
+    });
+  }
+
+  async function createWorkspace(event: FormEvent) {
+    event.preventDefault();
+    await runAction(async () => {
+      const result = await api<{ message: string; status?: string; notification_sent?: boolean }>("/companies", { method: "POST", body: JSON.stringify({ name: companyName }) });
+      if (result.status === "pending" || result.message?.toLowerCase().includes("approval")) {
+        setWorkspaceRequestPending(true);
+        setMessage(result.notification_sent === false ? `${result.message} Administrator email was not delivered; SMTP configuration is required.` : result.message);
+        return;
+      }
+      await refreshMe();
+      setMessage(result.message || "Workspace created.");
+    });
+  }
+
+  if (inviteToken && inviteInfo) {
+    return (
+      <main className="auth-shell"><section className="auth-card">
+        <div className="brand-mark">TV</div><p className="eyebrow">WORKSPACE INVITATION</p><h1>Join {inviteInfo.company_name}</h1>
+        <p className="muted">Invitation for {inviteInfo.email} · Role: {inviteInfo.role}</p>
+        <form onSubmit={acceptInvitation} className="stack">
+          <label>Create password<input type="password" minLength={12} autoComplete="new-password" value={invitePassword} onChange={(e) => setInvitePassword(e.target.value)} required /></label>
+          <button className="primary" disabled={busy}>{busy ? "Please wait…" : "Accept invitation"}</button>
+        </form>
+        {error && <p className="notice error">{error}</p>}{message && <p className="notice success">{message}</p>}
+      </section></main>
+    );
   }
 
   if (!user) {
@@ -282,16 +363,30 @@ function App() {
             <button className={authMode === "login" ? "active" : ""} onClick={() => setAuthMode("login")}>Sign in</button>
             <button className={authMode === "register" ? "active" : ""} onClick={() => setAuthMode("register")}>Create account</button>
           </div>
+          <button className="secondary google-button" type="button" onClick={() => { window.location.href = "/auth/google"; }}>Continue with Google</button>
+          <p className="muted auth-separator">or use email and password</p>
           <form onSubmit={submitAuth} className="stack">
             <label>Email<input type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} required /></label>
             <label>Password<input type="password" autoComplete={authMode === "login" ? "current-password" : "new-password"} minLength={12} value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
-            {authMode === "register" && <label>Company / workspace name<input value={companyName} onChange={(e) => setCompanyName(e.target.value)} maxLength={200} required /></label>}
+            {authMode === "register" && <><label>Company / workspace name<input value={companyName} onChange={(e) => setCompanyName(e.target.value)} maxLength={200} required /></label><small className="muted">If this company already exists, its administrators must approve your administrator request.</small></>}
             <button className="primary" disabled={busy}>{busy ? "Please wait…" : authMode === "login" ? "Sign in" : "Create workspace"}</button>
           </form>
           {error && <p className="notice error">{error}</p>}
           {message && <p className="notice success">{message}</p>}
         </section>
       </main>
+    );
+  }
+
+  if (user && companies.length === 0) {
+    return (
+      <main className="auth-shell"><section className="auth-card">
+        <div className="brand-mark">TV</div><p className="eyebrow">WORKSPACE SETUP</p><h1>Welcome to TrustVault</h1>
+        <p className="muted">Signed in as {user.email}. Create a new workspace or request administrator approval for an existing company.</p>
+        {workspaceRequestPending ? <><p className="notice success">Your request is pending. The company's current administrators must approve it before you can access the workspace.</p><button className="secondary" onClick={() => runAction(async () => { const me = await api<User>("/me"); setUser(me); setCompanies(me.companies || []); setActiveCompanyId(me.active_company_id); if (me.companies.length) setWorkspaceRequestPending(false); else setMessage("No approval yet. Please check again later."); })}>Check approval status</button></> : <form onSubmit={createWorkspace} className="stack"><label>Company / workspace name<input value={companyName} onChange={(e) => setCompanyName(e.target.value)} maxLength={200} required /></label><button className="primary" disabled={busy}>{busy ? "Please wait…" : "Create workspace / Request access"}</button></form>}
+        <button className="secondary" onClick={logout}>Sign out</button>
+        {error && <p className="notice error">{error}</p>}{message && <p className="notice success">{message}</p>}
+      </section></main>
     );
   }
 
@@ -309,8 +404,8 @@ function App() {
         </div>
         <nav className="nav-tabs">
           <button className={tab === "documents" ? "selected" : ""} onClick={() => setTab("documents")}>▤ <span>Documents</span></button>
-          <button className={tab === "members" ? "selected" : ""} onClick={() => setTab("members")}>♙ <span>Members</span></button>
-          <button className={tab === "audit" ? "selected" : ""} onClick={() => setTab("audit")}>◷ <span>Audit trail</span></button>
+          {activeCompany?.role === "admin" && <button className={tab === "members" ? "selected" : ""} onClick={() => setTab("members")}>♙ <span>Members</span></button>}
+          {activeCompany?.role === "admin" && <button className={tab === "audit" ? "selected" : ""} onClick={() => setTab("audit")}>◷ <span>Audit trail</span></button>}
         </nav>
         <div className="sidebar-bottom">
           <div className="avatar">{user.email.slice(0, 1).toUpperCase()}</div>
@@ -349,7 +444,7 @@ function App() {
                 </button>)}
                 {documents.length === 0 && <div className="small-empty">No accessible documents yet. Create one to get started.</div>}
               </div>
-              <form className="create-form" onSubmit={createDocument}>
+              {activeCompany.role !== "viewer" && <form className="create-form" onSubmit={createDocument}>
                 <h3>Create a document</h3>
                 <label>Title<input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} maxLength={255} required /></label>
                 <div className="two-col">
@@ -357,7 +452,7 @@ function App() {
                 </div>
                 <label>Description<textarea value={newDescription} onChange={(e) => setNewDescription(e.target.value)} maxLength={5000} rows={2} /></label>
                 <button className="primary" disabled={busy}>＋ Create document</button>
-              </form>
+              </form>}
             </section>
 
             <section className="panel detail-panel">
@@ -399,13 +494,17 @@ function App() {
           <section className="panel wide-panel">
             <div className="panel-heading"><div><h2>Members</h2><p>Membership and role are specific to this workspace.</p></div></div>
             <form className="inline-form add-member-form" onSubmit={addMember}>
-              <input type="email" placeholder="Add existing account by email" value={memberEmail} onChange={(e) => setMemberEmail(e.target.value)} required />
-              <button className="primary" disabled={busy}>＋ Add member</button>
+              <input type="email" placeholder="Invite by email address" value={memberEmail} onChange={(e) => setMemberEmail(e.target.value)} required />
+              <select value={memberRole} onChange={(e) => setMemberRole(e.target.value as "member" | "viewer")}><option value="member">Member</option><option value="viewer">Viewer</option></select>
+              <button className="primary" disabled={busy}>＋ Send invitation</button>
             </form>
-            <div className="table-wrap"><table><thead><tr><th>Member</th><th>User ID</th><th>Workspace role</th><th>Joined</th></tr></thead><tbody>
-              {members.map((member) => <tr key={member.user_id}><td>{member.email}</td><td>{member.user_id}</td><td><span className={`role-pill ${member.workspace_role}`}>{member.workspace_role}</span></td><td>{new Date(member.joined_at).toLocaleDateString()}</td></tr>)}
+            <p className="muted">New users receive a one-time email link to set a password. Administrator access is handled through approval requests.</p>
+            <div className="table-wrap"><table><thead><tr><th>Member</th><th>User ID</th><th>Workspace role</th><th>Joined</th><th>Actions</th></tr></thead><tbody>
+              {members.map((member) => <tr key={member.user_id}><td>{member.email}</td><td>{member.user_id}</td><td><span className={`role-pill ${member.workspace_role}`}>{member.workspace_role}</span></td><td>{new Date(member.joined_at).toLocaleDateString()}</td><td>{member.user_id !== user.id && <button className="danger-button" onClick={() => removeMember(member)} disabled={busy}>Remove</button>}</td></tr>)}
             </tbody></table></div>
-            {!members.length && <p className="muted">No member data loaded. This view is available to workspace administrators.</p>}
+            {!members.length && <p className="muted">No member data loaded.</p>}
+            <div className="panel-heading section-subheading"><div><h2>Pending administrator requests</h2><p>Approve only people you recognize and expect to join this workspace as administrators.</p></div></div>
+            {joinRequests.length ? <div className="table-wrap"><table><thead><tr><th>Email</th><th>Requested</th><th>Expires</th><th>Decision</th></tr></thead><tbody>{joinRequests.map((item) => <tr key={item.id}><td>{item.email}</td><td>{new Date(item.created_at).toLocaleDateString()}</td><td>{new Date(item.expires_at).toLocaleString()}</td><td><button className="primary" onClick={() => decideJoinRequest(item.id, "approve")} disabled={busy}>Approve</button> <button className="danger-button" onClick={() => decideJoinRequest(item.id, "reject")} disabled={busy}>Reject</button></td></tr>)}</tbody></table></div> : <p className="muted">No pending administrator requests.</p>}
           </section>
         ) : (
           <section className="panel wide-panel">

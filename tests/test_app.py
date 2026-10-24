@@ -4,7 +4,7 @@ import pytest
 from backend.app import create_app
 from backend.extensions import db
 from backend.audit import log_audit_event, verify_audit_chain
-from backend.models import AuditLog, Company, CompanyMembership, User
+from backend.models import AuditLog, Company, CompanyMembership, User, WorkspaceInvitation, WorkspaceJoinRequest
 
 from backend.email_service import send_email
 
@@ -933,3 +933,115 @@ def test_workspace_admin_can_add_account_already_in_another_workspace(app):
     assert login(member, "existing-member@example.com").status_code == 200
     companies = member.get("/companies").get_json()["companies"]
     assert len(companies) == 2
+
+
+
+def test_existing_company_signup_requires_admin_approval_and_creates_no_duplicate(app, monkeypatch):
+    import re
+    import backend.app as app_module
+
+    sent = []
+    app.config["MAIL_SUPPRESS_SEND"] = False
+    monkeypatch.setattr(app_module, "send_email", lambda to, subject, body: sent.append((to, subject, body)))
+    admin = app.test_client()
+    register_and_login(admin, "company-admin@example.com", "Acme Research")
+
+    applicant = app.test_client()
+    response = register(applicant, "new-admin@example.com", "  acme   research ")
+    assert response.status_code == 202
+    assert response.get_json()["status"] == "pending"
+
+    with app.app_context():
+        assert db.session.execute(db.select(db.func.count(Company.id))).scalar_one() == 1
+        assert db.session.execute(db.select(User).filter_by(email="new-admin@example.com")).scalar_one_or_none() is None
+
+    requests_response = admin.get("/admin/join-requests")
+    assert requests_response.status_code == 200
+    request_id = requests_response.get_json()["requests"][0]["id"]
+    decision = admin.post(
+        f"/admin/join-requests/{request_id}/decision",
+        json={"decision": "approve"},
+        headers=csrf_headers(admin),
+    )
+    assert decision.status_code == 200
+    assert sent
+    token_match = re.search(r"\?token=([^\s]+)", sent[-1][2])
+    assert token_match
+    token = token_match.group(1)
+
+    validate = applicant.get(f"/invites/validate?token={token}")
+    assert validate.status_code == 200
+    accept = applicant.post(
+        "/invites/accept",
+        json={"token": token, "password": PASSWORD},
+        headers=csrf_headers(applicant),
+    )
+    assert accept.status_code == 200
+    me = applicant.get("/me")
+    assert me.status_code == 200
+    assert me.get_json()["companies"][0]["role"] == "admin"
+    with app.app_context():
+        assert db.session.execute(db.select(db.func.count(Company.id))).scalar_one() == 1
+
+
+def test_admin_can_invite_viewer_and_remove_workspace_membership(app, monkeypatch):
+    import re
+    import backend.app as app_module
+
+    sent = []
+    app.config["MAIL_SUPPRESS_SEND"] = False
+    monkeypatch.setattr(app_module, "send_email", lambda to, subject, body: sent.append((to, subject, body)))
+    admin = app.test_client()
+    register_and_login(admin, "invite-admin@example.com", "Invite Workspace")
+    response = admin.post(
+        "/admin/members",
+        json={"email": "invited-viewer@example.com", "role": "viewer"},
+        headers=csrf_headers(admin),
+    )
+    assert response.status_code == 201
+    token = re.search(r"\?token=([^\s]+)", sent[-1][2]).group(1)
+    viewer = app.test_client()
+    accepted = viewer.post(
+        "/invites/accept",
+        json={"token": token, "password": PASSWORD},
+        headers=csrf_headers(viewer),
+    )
+    assert accepted.status_code == 200
+    assert viewer.post(
+        "/documents",
+        json={"title": "Should be blocked", "category": "Test", "description": ""},
+        headers=csrf_headers(viewer),
+    ).status_code == 403
+    with app.app_context():
+        viewer_user_id = db.session.execute(db.select(User.id).filter_by(email="invited-viewer@example.com")).scalar_one()
+        assert db.session.execute(db.select(CompanyMembership).filter_by(user_id=viewer_user_id)).scalar_one().role == "viewer"
+    removed = admin.delete(f"/admin/members/{viewer_user_id}", json={}, headers=csrf_headers(admin))
+    assert removed.status_code == 200
+    with app.app_context():
+        assert db.session.execute(db.select(CompanyMembership).filter_by(user_id=viewer_user_id)).scalar_one_or_none() is None
+
+
+def test_google_login_reports_missing_configuration(app):
+    app.config["GOOGLE_CLIENT_ID"] = ""
+    app.config["GOOGLE_CLIENT_SECRET"] = ""
+    response = app.test_client().get("/auth/google")
+    assert response.status_code == 302
+    assert "oauth_error=not_configured" in response.headers["Location"]
+
+
+def test_invitation_tokens_expire_and_are_single_use(app, monkeypatch):
+    import re
+    import backend.app as app_module
+
+    sent = []
+    app.config["MAIL_SUPPRESS_SEND"] = False
+    monkeypatch.setattr(app_module, "send_email", lambda to, subject, body: sent.append((to, subject, body)))
+    admin = app.test_client()
+    register_and_login(admin, "expiry-admin@example.com", "Expiry Workspace")
+    response = admin.post("/admin/members", json={"email": "once@example.com"}, headers=csrf_headers(admin))
+    assert response.status_code == 201
+    token = re.search(r"\?token=([^\s]+)", sent[-1][2]).group(1)
+    client = app.test_client()
+    assert client.get(f"/invites/validate?token={token}").status_code == 200
+    assert client.post("/invites/accept", json={"token": token, "password": PASSWORD}, headers=csrf_headers(client)).status_code == 200
+    assert client.get(f"/invites/validate?token={token}").status_code == 410

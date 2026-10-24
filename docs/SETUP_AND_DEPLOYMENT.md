@@ -21,7 +21,7 @@ npm install
 npm run dev
 ```
 
-Use the Vite URL printed by the command. The development proxy forwards API calls to `http://127.0.0.1:5000`. Build static frontend assets with `npm run build`.
+Use the Vite URL printed by the command. The development proxy forwards API calls to `http://localhost:5000`. Build static frontend assets with `npm run build`.
 
 ## Configuration
 
@@ -42,3 +42,32 @@ Use the Vite URL printed by the command. The development proxy forwards API call
 - Add rate limiting, monitoring/alerts, upload malware/content scanning, storage quotas, and orphan-file cleanup.
 - Use a dedicated external audit sink or signed checkpoints if the threat model requires stronger tamper evidence than an in-database hash chain.
 - Review CORS, reverse-proxy headers, request size limits, error handling and log redaction before exposing the service publicly.
+
+
+## Google sign-in and invitation email configuration
+
+Set these values in the private `.env` file (never commit `.env`):
+
+```dotenv
+GOOGLE_CLIENT_ID=your-google-oauth-client-id
+GOOGLE_CLIENT_SECRET=your-google-oauth-client-secret
+FRONTEND_URL=http://localhost:5173
+BACKEND_URL=http://localhost:5000
+MAIL_SUPPRESS_SEND=false
+MAIL_SERVER=smtp.example.com
+MAIL_PORT=587
+MAIL_USE_TLS=true
+MAIL_USE_SSL=false
+MAIL_USERNAME=your-smtp-username
+MAIL_PASSWORD=your-smtp-password
+MAIL_DEFAULT_SENDER=TrustVault <no-reply@example.com>
+INVITATION_TTL_HOURS=48
+JOIN_REQUEST_TTL_HOURS=72
+COOKIE_SECURE=false
+```
+
+Create a Google OAuth Web application in Google Cloud Console. For local development, add the authorized redirect URI `http://localhost:5000/auth/google/callback`. For production, set `BACKEND_URL` to the HTTPS backend origin, use `https://YOUR_BACKEND_HOST/auth/google/callback` as the authorized redirect URI, and update `FRONTEND_URL` to the deployed frontend origin. Google OAuth will not work until the client ID/secret and redirect URI match.
+
+Email delivery requires a working SMTP account. Invitation and administrator-approval emails are best-effort; check the backend log and `notification_sent` response when delivery fails. Tokens are stored as SHA-256 digests, are single-use, and expire. Never put provider credentials in source control.
+
+The company-name duplicate check normalizes capitalization and whitespace before matching. Existing duplicate workspace records are not automatically merged, because merging companies can alter ownership and audit history; inspect and reconcile old duplicates separately before production deployment.

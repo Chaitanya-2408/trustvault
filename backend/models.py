@@ -3,6 +3,7 @@ from datetime import datetime
 
 from flask_login import UserMixin
 from werkzeug.security import check_password_hash, generate_password_hash
+from sqlalchemy.orm import validates
 
 from backend.extensions import db, login_manager
 
@@ -15,7 +16,7 @@ class User(UserMixin, db.Model):
         nullable=False,
         index=True,
     )
-    password_hash = db.Column(db.String(255), nullable=False)
+    password_hash = db.Column(db.String(255), nullable=True)
     role = db.Column(db.String(20), nullable=False, default="viewer")
 
     memberships = db.relationship(
@@ -28,7 +29,7 @@ class User(UserMixin, db.Model):
         self.password_hash = generate_password_hash(password)
 
     def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
+        return bool(self.password_hash) and check_password_hash(self.password_hash, password)
 
 
 class Company(db.Model):
@@ -36,6 +37,7 @@ class Company(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(200), nullable=False)
+    normalized_name = db.Column(db.String(512), nullable=False, unique=True, index=True)
     created_at = db.Column(
         db.DateTime,
         nullable=False,
@@ -48,6 +50,10 @@ class Company(db.Model):
         cascade="all, delete-orphan",
     )
 
+    @validates("name")
+    def normalize_name(self, key, value):
+        self.normalized_name = " ".join((value or "").split()).casefold()
+        return value
 
 
 class CompanyMembership(db.Model):
@@ -60,7 +66,7 @@ class CompanyMembership(db.Model):
             name="uq_company_membership_user",
         ),
         db.CheckConstraint(
-            "role IN ('admin', 'member')",
+            "role IN ('admin', 'member', 'viewer')",
             name="ck_company_membership_role",
         ),
     )
@@ -177,6 +183,43 @@ class DocumentPermission(db.Model):
         backref=db.backref("permissions", cascade="all, delete-orphan"),
     )
     user = db.relationship("User", backref="document_permissions")
+
+
+class WorkspaceInvitation(db.Model):
+    """Single-use, expiring invitation for a workspace membership."""
+
+    __tablename__ = "workspace_invitation"
+
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey("company.id"), nullable=False, index=True)
+    email = db.Column(db.String(255), nullable=False, index=True)
+    role = db.Column(db.String(20), nullable=False, default="member")
+    token_hash = db.Column(db.String(64), nullable=False, unique=True)
+    invited_by_user_id = db.Column(db.Integer, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    accepted_at = db.Column(db.DateTime, nullable=True)
+    revoked_at = db.Column(db.DateTime, nullable=True)
+
+    company = db.relationship("Company", backref="invitations")
+
+
+class WorkspaceJoinRequest(db.Model):
+    """Pending request to become an administrator of an existing workspace."""
+
+    __tablename__ = "workspace_join_request"
+
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey("company.id"), nullable=False, index=True)
+    requester_email = db.Column(db.String(255), nullable=False, index=True)
+    requested_role = db.Column(db.String(20), nullable=False, default="admin")
+    status = db.Column(db.String(20), nullable=False, default="pending", index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    decided_at = db.Column(db.DateTime, nullable=True)
+    decided_by_user_id = db.Column(db.Integer, nullable=True)
+
+    company = db.relationship("Company", backref="join_requests")
 
 
 @login_manager.user_loader

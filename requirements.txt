@@ -7,3 +7,5 @@ python-dotenv
 SQLAlchemy
 pytest
 psycopg[binary]
+Authlib>=1.3,<2
+requests

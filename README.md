@@ -101,3 +101,14 @@ Single-workspace accounts are selected automatically for backward compatibility.
 - Use HTTPS, strong secrets, database backups, upload scanning, rate limiting, and operational monitoring before production deployment.
 
 See [`docs/API.md`](docs/API.md), [`docs/SETUP_AND_DEPLOYMENT.md`](docs/SETUP_AND_DEPLOYMENT.md), and [`THREATS.md`](THREATS.md).
+
+
+## New onboarding and identity features
+
+- Optional Google OAuth sign-in (requires Google Cloud OAuth credentials).
+- Workspace roles: Administrator, Member, and Viewer. Viewer is read-only.
+- Email invitations for new members with one-time password setup links.
+- Workspace administrators can remove memberships without deleting user accounts or memberships in other workspaces.
+- Requests to become an administrator of an existing company require approval by a current workspace administrator.
+
+See `docs/SETUP_AND_DEPLOYMENT.md` for Google OAuth and SMTP setup. Apply migrations before running the updated app.
