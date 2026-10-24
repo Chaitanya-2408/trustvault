@@ -183,6 +183,16 @@ def create_app(test_config=None):
             "service": "TrustVault",
         }), 200
 
+    @app.get("/cors-debug")
+    def cors_debug():
+        return jsonify({
+            "frontend_url": app.config.get("FRONTEND_URL"),
+            "cors_handler_registered": any(
+                getattr(handler, "__name__", "") == "add_cors_headers"
+                for handler in app.after_request_funcs.get(None, [])
+            ),
+        }), 200
+
     @app.get("/csrf-token")
     def csrf_token():
         return jsonify({"csrf_token": generate_csrf()}), 200
