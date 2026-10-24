@@ -52,9 +52,11 @@ def create_app(test_config=None):
     )
     os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
-    cookie_secure = (
-        os.environ.get("COOKIE_SECURE", "false").lower() == "true"
-    )
+    # Cross-site session cookies must be Secure when the frontend is HTTPS.
+    # COOKIE_SECURE can explicitly override this default in the environment.
+    frontend_url_env = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+    default_cookie_secure = "true" if frontend_url_env.startswith("https://") else "false"
+    cookie_secure = os.environ.get("COOKIE_SECURE", default_cookie_secure).lower() == "true"
 
     app.config.update(
         SECRET_KEY=os.environ.get("SECRET_KEY"),
@@ -1870,4 +1872,33 @@ def create_app(test_config=None):
             "pages": pagination.pages,
         }), 200
 
+    # Final WSGI-level CORS enforcement. This wraps every Flask response,
+    # including automatic OPTIONS responses and error/unauthorized responses.
+    # It intentionally allows only the configured frontend origin.
+    flask_wsgi_app = app.wsgi_app
+
+    def cors_wsgi_app(environ, start_response):
+        origin = environ.get("HTTP_ORIGIN", "")
+        allowed_origin = app.config.get("FRONTEND_URL", "").rstrip("/")
+
+        def cors_start_response(status, headers, exc_info=None):
+            if origin and allowed_origin and origin.rstrip("/") == allowed_origin:
+                cors_headers = {
+                    "access-control-allow-origin": origin,
+                    "access-control-allow-credentials": "true",
+                    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+                    "access-control-allow-headers": "Content-Type, X-CSRFToken, X-CSRF-Token",
+                    "access-control-expose-headers": "Content-Disposition",
+                }
+                headers = [
+                    (key, value) for key, value in headers
+                    if key.lower() not in cors_headers and key.lower() != "vary"
+                ]
+                headers.extend((key, value) for key, value in cors_headers.items())
+                headers.append(("Vary", "Origin"))
+            return start_response(status, headers, exc_info)
+
+        return flask_wsgi_app(environ, cors_start_response)
+
+    app.wsgi_app = cors_wsgi_app
     return app

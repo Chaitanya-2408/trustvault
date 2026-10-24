@@ -40,6 +40,7 @@ class Company(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(200), nullable=False)
     normalized_name = db.Column(db.String(512), nullable=False, unique=True, index=True)
+    owner_user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True, index=True)
     created_at = db.Column(
         db.DateTime,
         nullable=False,
@@ -214,7 +215,7 @@ class WorkspaceJoinRequest(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     company_id = db.Column(db.Integer, db.ForeignKey("company.id"), nullable=False, index=True)
     requester_email = db.Column(db.String(255), nullable=False, index=True)
-    requested_role = db.Column(db.String(20), nullable=False, default="admin")
+    requested_role = db.Column(db.String(20), nullable=False, default="member")
     status = db.Column(db.String(20), nullable=False, default="pending", index=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     expires_at = db.Column(db.DateTime, nullable=False)
