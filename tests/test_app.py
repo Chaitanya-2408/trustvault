@@ -4,7 +4,7 @@ import pytest
 from backend.app import create_app
 from backend.extensions import db
 from backend.audit import log_audit_event, verify_audit_chain
-from backend.models import AuditLog, Company, CompanyMembership, User, WorkspaceInvitation, WorkspaceJoinRequest
+from backend.models import AuditLog, Company, CompanyMembership, User, WorkspaceInvitation, WorkspaceJoinRequest, LoginOTP
 
 from backend.email_service import send_email
 
@@ -75,9 +75,19 @@ def register(client, email, company_name=None):
 
 
 def login(client, email):
-    return client.post(
+    response = client.post(
         "/login",
         json={"email": email, "password": PASSWORD},
+        headers=csrf_headers(client),
+    )
+    if response.status_code != 200:
+        return response
+    payload = response.get_json()
+    # The OTP is exposed only in Flask TESTING mode, allowing the test client
+    # to exercise the real two-step authentication flow without SMTP.
+    return client.post(
+        "/login/verify-otp",
+        json={"challenge_id": payload["challenge_id"], "otp": payload["test_otp"]},
         headers=csrf_headers(client),
     )
 
@@ -1045,3 +1055,38 @@ def test_invitation_tokens_expire_and_are_single_use(app, monkeypatch):
     assert client.get(f"/invites/validate?token={token}").status_code == 200
     assert client.post("/invites/accept", json={"token": token, "password": PASSWORD}, headers=csrf_headers(client)).status_code == 200
     assert client.get(f"/invites/validate?token={token}").status_code == 410
+
+
+def test_login_requires_otp_before_authentication(client):
+    assert register(client, "otp-user@example.com").status_code == 201
+    response = client.post("/login", json={"email": "otp-user@example.com", "password": PASSWORD}, headers=csrf_headers(client))
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload.get("challenge_id") and payload.get("test_otp")
+    assert client.get("/me").status_code == 401
+    verified = client.post("/login/verify-otp", json={"challenge_id": payload["challenge_id"], "otp": payload["test_otp"]}, headers=csrf_headers(client))
+    assert verified.status_code == 200
+    assert client.get("/me").status_code == 200
+
+
+def test_forgot_password_response_does_not_reveal_account_existence(client):
+    existing = register(client, "reset-user@example.com")
+    assert existing.status_code == 201
+    a = client.post("/forgot-password", json={"email": "reset-user@example.com"}, headers=csrf_headers(client))
+    b = client.post("/forgot-password", json={"email": "missing@example.com"}, headers=csrf_headers(client))
+    assert a.status_code == b.status_code == 200
+    assert a.get_json()["message"] == b.get_json()["message"]
+
+
+
+def test_password_reset_changes_password(client):
+    assert register(client, "reset-flow@example.com").status_code == 201
+    requested = client.post("/forgot-password", json={"email": "reset-flow@example.com"}, headers=csrf_headers(client))
+    payload = requested.get_json()
+    assert requested.status_code == 200 and payload.get("test_otp")
+    reset = client.post("/reset-password", json={"challenge_id": payload["challenge_id"], "otp": payload["test_otp"], "new_password": "Another-Correct-Horse-99"}, headers=csrf_headers(client))
+    assert reset.status_code == 200
+    old_login = client.post("/login", json={"email": "reset-flow@example.com", "password": PASSWORD}, headers=csrf_headers(client))
+    assert old_login.status_code == 401
+    new_login = client.post("/login", json={"email": "reset-flow@example.com", "password": "Another-Correct-Horse-99"}, headers=csrf_headers(client))
+    assert new_login.status_code == 200

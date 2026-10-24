@@ -14,3 +14,10 @@ instance/
 private_uploads/
 node_modules/
 dist/
+
+
+
+frontend/tsconfig.tsbuildinfo
+*.db
+*.sqlite
+*.sqlite3

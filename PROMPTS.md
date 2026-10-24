@@ -145,3 +145,11 @@
 **Validation:** Ran `python -m pytest -q`. Result: **35 passed in 13.23 seconds**. Also ran `npm run build` successfully, confirming that TypeScript compilation and the Vite production build completed without errors.
 
 **Learning:** OAuth configuration should be validated using the application's current settings before initiating authorization. Tests should verify missing-credential handling while preserving the normal Google sign-in flow when valid credentials are configured.
+
+## Authentication update (email OTP + password recovery)
+- Email/password sign-in now requires a short-lived email OTP before a Flask-Login session is created. Google OAuth remains a separate, unchanged flow.
+- Forgot-password returns a generic response to avoid revealing whether an email is registered. Reset codes expire after five minutes, are stored as keyed hashes, and are limited to five verification attempts.
+- Configure SMTP using the variables in `.env.example`; do not commit `.env`.
+- Apply migrations with `python -m flask --app backend.app db upgrade`.
+- The frontend Vite proxy includes `/forgot-password` and `/reset-password`.
+- In tests only, `test_otp` is returned to allow exercising OTP flows without an SMTP server. It is never returned when `app.testing` is false.

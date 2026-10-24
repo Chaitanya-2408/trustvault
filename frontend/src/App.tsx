@@ -18,8 +18,10 @@ type Tab = "documents" | "members" | "audit";
 
 let csrfToken = "";
 async function getCsrfToken() {
-  if (csrfToken) return csrfToken;
-  const response = await fetch("/csrf-token", { credentials: "include" });
+  // Fetch a token for the current Flask session on every state-changing request.
+  // Login OTP verification clears/rebuilds the session, so a cached token can
+  // become stale and cause CSRF 400 responses for logout/member removal.
+  const response = await fetch("/csrf-token", { credentials: "include", cache: "no-store" });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "Could not obtain CSRF token");
   csrfToken = data.csrf_token as string;
@@ -46,6 +48,10 @@ async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authStep, setAuthStep] = useState<"credentials" | "login-otp" | "forgot" | "reset">("credentials");
+  const [challengeId, setChallengeId] = useState("");
+  const [otp, setOtp] = useState("");
+  const [newPassword, setNewPassword] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [companyName, setCompanyName] = useState("");
@@ -159,10 +165,46 @@ function App() {
         setPassword("");
         return;
       }
-      await api("/login", { method: "POST", body: JSON.stringify({ email, password }) });
-      await refreshMe();
+      const result = await api<{ message: string; challenge_id: string }>("/login", { method: "POST", body: JSON.stringify({ email, password }) });
+      setChallengeId(result.challenge_id);
+      setOtp("");
       setPassword("");
-      setMessage("Signed in successfully.");
+      setAuthStep("login-otp");
+      setMessage("We sent a verification code to your email. It expires in 5 minutes.");
+    });
+  }
+
+  async function verifyLoginOtp(event: FormEvent) {
+    event.preventDefault();
+    await runAction(async () => {
+      await api("/login/verify-otp", { method: "POST", body: JSON.stringify({ challenge_id: challengeId, otp }) });
+      setOtp(""); setChallengeId(""); setAuthStep("credentials");
+      await refreshMe(); setMessage("Signed in securely.");
+    });
+  }
+
+  async function resendLoginOtp() {
+    await runAction(async () => {
+      const result = await api<{ challenge_id: string; message: string }>("/login/resend-otp", { method: "POST", body: JSON.stringify({ challenge_id: challengeId }) });
+      setChallengeId(result.challenge_id); setOtp(""); setMessage(result.message);
+    });
+  }
+
+  async function requestPasswordReset(event: FormEvent) {
+    event.preventDefault();
+    await runAction(async () => {
+      const result = await api<{ challenge_id: string; message: string }>("/forgot-password", { method: "POST", body: JSON.stringify({ email }) });
+      setChallengeId(result.challenge_id); setOtp(""); setAuthStep("reset"); setMessage(result.message);
+      // The same next step is shown regardless of whether the email is registered.
+    });
+  }
+
+  async function completePasswordReset(event: FormEvent) {
+    event.preventDefault();
+    await runAction(async () => {
+      await api("/reset-password", { method: "POST", body: JSON.stringify({ challenge_id: challengeId, otp, new_password: newPassword }) });
+      setAuthStep("credentials"); setAuthMode("login"); setOtp(""); setNewPassword(""); setChallengeId("");
+      setMessage("Password updated. Sign in with your new password.");
     });
   }
 
@@ -354,25 +396,28 @@ function App() {
   if (!user) {
     return (
       <main className="auth-shell">
-        <section className="auth-card">
-          <div className="brand-mark">TV</div>
+        <section className="auth-card auth-card-modern">
+          <div className="auth-brand-row"><div className="brand-mark">TV</div><span className="security-pill"><span className="status-dot" /> Secure by design</span></div>
           <p className="eyebrow">PRIVATE DOCUMENT WORKSPACE</p>
-          <h1>TrustVault</h1>
-          <p className="muted">Share important files with clear permissions and an audit trail.</p>
-          <div className="auth-toggle">
-            <button className={authMode === "login" ? "active" : ""} onClick={() => setAuthMode("login")}>Sign in</button>
-            <button className={authMode === "register" ? "active" : ""} onClick={() => setAuthMode("register")}>Create account</button>
-          </div>
-          <button className="secondary google-button" type="button" onClick={() => { window.location.href = "/auth/google"; }}>Continue with Google</button>
-          <p className="muted auth-separator">or use email and password</p>
-          <form onSubmit={submitAuth} className="stack">
-            <label>Email<input type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} required /></label>
-            <label>Password<input type="password" autoComplete={authMode === "login" ? "current-password" : "new-password"} minLength={12} value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
-            {authMode === "register" && <><label>Company / workspace name<input value={companyName} onChange={(e) => setCompanyName(e.target.value)} maxLength={200} required /></label><small className="muted">If this company already exists, its administrators must approve your administrator request.</small></>}
-            <button className="primary" disabled={busy}>{busy ? "Please wait…" : authMode === "login" ? "Sign in" : "Create workspace"}</button>
-          </form>
-          {error && <p className="notice error">{error}</p>}
-          {message && <p className="notice success">{message}</p>}
+          <h1>{authStep === "login-otp" ? "Check your inbox" : authStep === "forgot" ? "Recover your account" : authStep === "reset" ? "Reset your password" : "Your files. Your control."}</h1>
+          <p className="muted">{authStep === "login-otp" ? `Enter the 6-digit code sent to ${email}.` : authStep === "forgot" ? "Enter your account email and we’ll send reset instructions if an account exists." : authStep === "reset" ? "Enter the code from your email and choose a strong new password." : "Share important files with confidence, clear permissions, and a verifiable audit trail."}</p>
+          {authStep === "credentials" && <>
+            <div className="auth-toggle"><button type="button" className={authMode === "login" ? "active" : ""} onClick={() => { setAuthMode("login"); setError(""); setMessage(""); }}>Sign in</button><button type="button" className={authMode === "register" ? "active" : ""} onClick={() => { setAuthMode("register"); setError(""); setMessage(""); }}>Create account</button></div>
+            <button className="secondary google-button" type="button" onClick={() => { window.location.href = "/auth/google"; }}>Continue with Google</button>
+            <p className="muted auth-separator">or continue with email</p>
+            <form onSubmit={submitAuth} className="stack">
+              <label>Email address<input type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} required placeholder="you@company.com" /></label>
+              <label>Password<input type="password" autoComplete={authMode === "login" ? "current-password" : "new-password"} minLength={12} value={password} onChange={(e) => setPassword(e.target.value)} required placeholder="At least 12 characters" /></label>
+              {authMode === "register" && <><label>Company / workspace name<input value={companyName} onChange={(e) => setCompanyName(e.target.value)} maxLength={200} required placeholder="Your organization" /></label><small className="muted">If this company already exists, its administrators must approve your administrator request.</small></>}
+              <button className="primary auth-submit" disabled={busy}>{busy ? "Please wait…" : authMode === "login" ? "Continue securely →" : "Create workspace →"}</button>
+            </form>
+            {authMode === "login" && <button className="text-button" type="button" onClick={() => { setAuthStep("forgot"); setError(""); setMessage(""); }}>Forgot password?</button>}
+          </>}
+          {authStep === "login-otp" && <form onSubmit={verifyLoginOtp} className="stack auth-flow-form"><label>6-digit verification code<input inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} value={otp} onChange={(e) => setOtp(e.target.value.replace(/\D/g, "").slice(0, 6))} required placeholder="000000" className="otp-input" /></label><button className="primary auth-submit" disabled={busy || otp.length !== 6}>{busy ? "Verifying…" : "Verify and sign in →"}</button><button className="text-button" type="button" onClick={resendLoginOtp} disabled={busy}>Send a new code</button><button className="text-button muted-action" type="button" onClick={() => { setAuthStep("credentials"); setChallengeId(""); setOtp(""); }}>Back to sign in</button></form>}
+          {authStep === "forgot" && <form onSubmit={requestPasswordReset} className="stack auth-flow-form"><label>Email address<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required placeholder="you@company.com" /></label><button className="primary auth-submit" disabled={busy}>{busy ? "Sending…" : "Send reset code →"}</button><button className="text-button muted-action" type="button" onClick={() => setAuthStep("credentials")}>Back to sign in</button></form>}
+          {authStep === "reset" && <form onSubmit={completePasswordReset} className="stack auth-flow-form"><label>6-digit reset code<input inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} value={otp} onChange={(e) => setOtp(e.target.value.replace(/\D/g, "").slice(0, 6))} required placeholder="000000" className="otp-input" /></label><label>New password<input type="password" autoComplete="new-password" minLength={12} value={newPassword} onChange={(e) => setNewPassword(e.target.value)} required placeholder="At least 12 characters" /></label><button className="primary auth-submit" disabled={busy || otp.length !== 6}>{busy ? "Updating…" : "Update password →"}</button><button className="text-button muted-action" type="button" onClick={() => setAuthStep("credentials")}>Back to sign in</button></form>}
+          {error && <p className="notice error" role="alert">{error}</p>}{message && <p className="notice success" role="status">{message}</p>}
+          <p className="auth-footnote">Protected with secure sessions · Email verification · Workspace-level access controls</p>
         </section>
       </main>
     );

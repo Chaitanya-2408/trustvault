@@ -1,6 +1,7 @@
 import os
 import secrets
 import hashlib
+import hmac
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from pathlib import Path
@@ -35,6 +36,7 @@ from backend.models import (
     User,
     WorkspaceInvitation,
     WorkspaceJoinRequest,
+    LoginOTP,
 )
 
 load_dotenv()
@@ -295,48 +297,162 @@ def create_app(test_config=None):
             return jsonify({"error": "An account or workspace with that information already exists; please try again."}), 409
         return jsonify({"message": "Account created", "workspace_role": "admin"}), 201
 
+    def _otp_digest(challenge_token, code):
+        secret = str(app.config["SECRET_KEY"]).encode("utf-8")
+        return hmac.new(secret, f"{challenge_token}:{code}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _issue_otp(user, purpose):
+        now = datetime.utcnow()
+        # Invalidate any older unconsumed challenge of the same purpose.
+        LoginOTP.query.filter_by(user_id=user.id, purpose=purpose, consumed_at=None).update({"consumed_at": now})
+        challenge_token = secrets.token_urlsafe(32)
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        row = LoginOTP(
+            user_id=user.id,
+            challenge_hash=hashlib.sha256(challenge_token.encode("utf-8")).hexdigest(),
+            otp_hash=_otp_digest(challenge_token, code),
+            purpose=purpose,
+            expires_at=now + timedelta(minutes=5),
+            attempts=0,
+        )
+        db.session.add(row)
+        db.session.commit()
+        label = "sign-in" if purpose == "login" else "password reset"
+        send_email(user.email, f"TrustVault {label} verification code", f"Your TrustVault {label} code is {code}. It expires in 5 minutes. If you did not request this, you can ignore this email.")
+        result = {"message": "Verification code sent to your email.", "challenge_id": challenge_token, "expires_in": 300}
+        # Test-only convenience; never return a code in a real environment.
+        if app.testing:
+            result["test_otp"] = code
+        return result
+
+    def _find_challenge(challenge_id, purpose):
+        if not isinstance(challenge_id, str) or not challenge_id or len(challenge_id) > 200:
+            return None
+        digest = hashlib.sha256(challenge_id.encode("utf-8")).hexdigest()
+        return LoginOTP.query.filter_by(challenge_hash=digest, purpose=purpose).first()
+
     @app.post("/login")
     def login():
         data = request.get_json(silent=True)
-
         if not isinstance(data, dict):
-            return jsonify({
-                "error": "Invalid email or password"
-            }), 400
-
-        email = data.get("email", "")
-        password = data.get("password", "")
-
+            return jsonify({"error": "Invalid email or password"}), 400
+        email, password = data.get("email", ""), data.get("password", "")
         if not isinstance(email, str) or not isinstance(password, str):
-            return jsonify({
-                "error": "Invalid email or password"
-            }), 400
-
-        user = db.session.execute(
-            db.select(User).filter_by(email=email.strip().lower())
-        ).scalar_one_or_none()
-
+            return jsonify({"error": "Invalid email or password"}), 400
+        user = db.session.execute(db.select(User).filter_by(email=email.strip().lower())).scalar_one_or_none()
         if user is None or not user.check_password(password):
-            return jsonify({
-                "error": "Invalid email or password"
-            }), 401
+            log_audit_event(action="LOGIN_PASSWORD_CHECK", outcome="DENIED", actor_email=email.strip().lower()[:255], details={"reason": "invalid_credentials"})
+            return jsonify({"error": "Invalid email or password"}), 401
+        try:
+            payload = _issue_otp(user, "login")
+        except Exception:
+            db.session.rollback()
+            app.logger.exception("Could not issue login OTP")
+            return jsonify({"error": "Could not send a verification code. Please try again later."}), 503
+        return jsonify(payload), 200
 
+    @app.post("/login/verify-otp")
+    def verify_login_otp():
+        data = request.get_json(silent=True) or {}
+        challenge_id, code = data.get("challenge_id"), data.get("otp")
+        row = _find_challenge(challenge_id, "login")
+        now = datetime.utcnow()
+        if row is None or row.consumed_at is not None or row.expires_at <= now or row.attempts >= 5:
+            return jsonify({"error": "This code is invalid or expired. Please sign in again."}), 400
+        if not isinstance(code, str) or not hmac.compare_digest(row.otp_hash, _otp_digest(challenge_id, code)):
+            row.attempts += 1
+            if row.attempts >= 5:
+                row.consumed_at = now
+            db.session.commit()
+            return jsonify({"error": "Incorrect verification code."}), 400
+        row.consumed_at = now
+        user = db.session.get(User, row.user_id)
+        if user is None:
+            db.session.commit()
+            return jsonify({"error": "Account not found."}), 400
+        # Rotate any pre-existing authenticated session and clear workspace selection.
+        logout_user()
+        session.clear()
         login_user(user)
-
-        # Never carry a previous account's selected workspace into this login.
-        session.pop("active_company_id", None)
-        memberships = db.session.execute(
-            db.select(CompanyMembership).filter_by(user_id=user.id)
-        ).scalars().all()
+        memberships = db.session.execute(db.select(CompanyMembership).filter_by(user_id=user.id)).scalars().all()
         if len(memberships) == 1:
             session["active_company_id"] = memberships[0].company_id
+        log_audit_event(action="LOGIN_OTP_VERIFIED", outcome="SUCCESS", actor_user_id=user.id, actor_email=user.email, details={"method": "email_otp"})
+        return jsonify({"message": "Logged in", "role": user.role, "active_company_id": session.get("active_company_id")}), 200
 
-        return jsonify({
-            "message": "Logged in",
-            "role": user.role,
-            "active_company_id": session.get("active_company_id"),
-        }), 200
+    @app.post("/login/resend-otp")
+    def resend_login_otp():
+        data = request.get_json(silent=True) or {}
+        old = _find_challenge(data.get("challenge_id"), "login")
+        now = datetime.utcnow()
+        if old is None or old.consumed_at is not None or old.expires_at <= now:
+            return jsonify({"error": "Please sign in again to request a new code."}), 400
+        if old.created_at > now - timedelta(seconds=60):
+            return jsonify({"error": "Please wait 60 seconds before requesting another code."}), 429
+        user = db.session.get(User, old.user_id)
+        if user is None:
+            return jsonify({"error": "Please sign in again."}), 400
+        try:
+            payload = _issue_otp(user, "login")
+        except Exception:
+            db.session.rollback()
+            app.logger.exception("Could not resend login OTP")
+            return jsonify({"error": "Could not send a verification code. Please try again later."}), 503
+        return jsonify(payload), 200
 
+    @app.post("/forgot-password")
+    def forgot_password():
+        data = request.get_json(silent=True) or {}
+        email = data.get("email", "")
+        if not isinstance(email, str) or not email.strip() or len(email) > 255:
+            return jsonify({"error": "Enter a valid email address."}), 400
+        user = db.session.execute(db.select(User).filter_by(email=email.strip().lower())).scalar_one_or_none()
+        # Always return a random challenge handle so the response shape does not
+        # disclose whether the email belongs to an account.
+        challenge_id = secrets.token_urlsafe(32)
+        if user is not None:
+            try:
+                issued = _issue_otp(user, "reset")
+                challenge_id = issued["challenge_id"]
+            except Exception:
+                db.session.rollback()
+                app.logger.exception("Could not issue password reset code")
+        result = {"message": "If an account exists for that email, a password reset code has been sent.", "challenge_id": challenge_id, "expires_in": 300}
+        if app.testing and user is not None:
+            # Only test clients receive this value; production never exposes OTPs.
+            row = _find_challenge(challenge_id, "reset")
+            # _issue_otp returns the test code in its result, so use it when available.
+            result["test_otp"] = issued.get("test_otp")
+        return jsonify(result), 200
+
+    @app.post("/reset-password")
+    def reset_password():
+        data = request.get_json(silent=True) or {}
+        challenge_id, code, new_password = data.get("challenge_id"), data.get("otp"), data.get("new_password")
+        if not isinstance(new_password, str) or len(new_password) < 12:
+            return jsonify({"error": "New password must be at least 12 characters."}), 400
+        row = _find_challenge(challenge_id, "reset")
+        now = datetime.utcnow()
+        if row is None or row.consumed_at is not None or row.expires_at <= now or row.attempts >= 5:
+            return jsonify({"error": "This code is invalid or expired. Request a new password reset code."}), 400
+        if not isinstance(code, str) or not hmac.compare_digest(row.otp_hash, _otp_digest(challenge_id, code)):
+            row.attempts += 1
+            if row.attempts >= 5:
+                row.consumed_at = now
+            db.session.commit()
+            return jsonify({"error": "Incorrect verification code."}), 400
+        user = db.session.get(User, row.user_id)
+        if user is None:
+            row.consumed_at = now
+            db.session.commit()
+            return jsonify({"error": "Account not found."}), 400
+        user.set_password(new_password)
+        row.consumed_at = now
+        # Invalidate every other active OTP for this account, including login challenges.
+        LoginOTP.query.filter(LoginOTP.user_id == user.id, LoginOTP.consumed_at.is_(None)).update({"consumed_at": now})
+        db.session.commit()
+        log_audit_event(action="PASSWORD_RESET", outcome="SUCCESS", actor_user_id=user.id, actor_email=user.email, details={"method": "email_otp"})
+        return jsonify({"message": "Password updated. You can now sign in with your new password."}), 200
     
     @app.get("/auth/google")
     def google_login():

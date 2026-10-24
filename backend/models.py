@@ -8,6 +8,8 @@ from sqlalchemy.orm import validates
 from backend.extensions import db, login_manager
 
 
+
+
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(
@@ -271,3 +273,55 @@ class AuditLog(db.Model):
 
     previous_hash = db.Column(db.String(64), nullable=False)
     event_hash = db.Column(db.String(64), nullable=False, unique=True)
+
+
+
+class LoginOTP(db.Model):
+    """A short-lived email OTP challenge for password-based login."""
+
+    __tablename__ = "login_otp"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    challenge_hash = db.Column(
+        db.String(64),
+        nullable=False,
+        unique=True,
+    )
+
+    otp_hash = db.Column(
+        db.String(64),
+        nullable=False,
+    )
+
+    purpose = db.Column(db.String(20), nullable=False, default="login", index=True)
+
+    expires_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        index=True,
+    )
+
+    attempts = db.Column(
+        db.Integer,
+        nullable=False,
+        default=0,
+    )
+
+    consumed_at = db.Column(
+        db.DateTime,
+        nullable=True,
+    )
+
+    created_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+    )
