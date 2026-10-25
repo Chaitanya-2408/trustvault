@@ -59,17 +59,21 @@ def csrf_headers(client):
     return {"X-CSRFToken": token}
 
 
-def register(client, email, company_name=None):
+def register(client, email, company_name=None, requested_role=None):
     if company_name is None:
         company_name = f"{email.split('@')[0]}'s Workspace"
 
+    payload = {
+        "email": email,
+        "password": PASSWORD,
+        "company_name": company_name,
+    }
+    if requested_role is not None:
+        payload["requested_role"] = requested_role
+
     return client.post(
         "/register",
-        json={
-            "email": email,
-            "password": PASSWORD,
-            "company_name": company_name,
-        },
+        json=payload,
         headers=csrf_headers(client),
     )
 
@@ -957,7 +961,7 @@ def test_existing_company_signup_requires_admin_approval_and_creates_no_duplicat
     register_and_login(admin, "company-admin@example.com", "Acme Research")
 
     applicant = app.test_client()
-    response = register(applicant, "new-admin@example.com", "  acme   research ")
+    response = register(applicant, "new-admin@example.com", "  acme   research ", requested_role="admin")
     assert response.status_code == 202
     assert response.get_json()["status"] == "pending"
 
@@ -1090,3 +1094,189 @@ def test_password_reset_changes_password(client):
     assert old_login.status_code == 401
     new_login = client.post("/login", json={"email": "reset-flow@example.com", "password": "Another-Correct-Horse-99"}, headers=csrf_headers(client))
     assert new_login.status_code == 200
+
+
+def test_normalize_url_and_allowed_origin_helpers():
+    from backend.app import _normalize_url, _is_allowed_origin
+
+    assert _normalize_url("trustvault-frontend-lemon.vercel.app") == "https://trustvault-frontend-lemon.vercel.app"
+    assert _normalize_url("http://localhost:5173/") == "http://localhost:5173"
+    assert _normalize_url("https://trustvault-backend-hfpk.onrender.com/") == "https://trustvault-backend-hfpk.onrender.com"
+    assert _normalize_url("") == ""
+
+    allowed_fe = "https://trustvault-frontend-lemon.vercel.app"
+    assert _is_allowed_origin("https://trustvault-frontend-lemon.vercel.app", allowed_fe) is True
+    assert _is_allowed_origin("https://trustvault-frontend-n135yxdoq-dasari-chaitanya-sai-ganesh.vercel.app", allowed_fe) is True
+    assert _is_allowed_origin("http://localhost:5173", allowed_fe) is True
+    assert _is_allowed_origin("https://malicious-attacker.com", allowed_fe) is False
+    assert _is_allowed_origin("https://random-app.vercel.app", allowed_fe) is False
+
+
+def test_cors_options_preflight_and_origin_headers():
+    prod_app = create_app({
+        "TESTING": True,
+        "SECRET_KEY": "test-key-prod",
+        "SQLALCHEMY_DATABASE_URI": "sqlite://",
+        "FRONTEND_URL": "https://trustvault-frontend-lemon.vercel.app",
+        "BACKEND_URL": "https://trustvault-backend-hfpk.onrender.com",
+    })
+    client = prod_app.test_client()
+
+    # Preflight OPTIONS request
+    preflight = client.open(
+        "/companies",
+        method="OPTIONS",
+        headers={
+            "Origin": "https://trustvault-frontend-lemon.vercel.app",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "X-CSRFToken, Content-Type",
+        },
+    )
+    assert preflight.status_code == 204
+    assert preflight.headers.get("Access-Control-Allow-Origin") == "https://trustvault-frontend-lemon.vercel.app"
+    assert preflight.headers.get("Access-Control-Allow-Credentials") == "true"
+    assert "POST" in preflight.headers.get("Access-Control-Allow-Methods", "")
+
+    # GET request with allowed origin
+    res = client.get("/health", headers={"Origin": "https://trustvault-frontend-lemon.vercel.app"})
+    assert res.status_code == 200
+    assert res.headers.get("Access-Control-Allow-Origin") == "https://trustvault-frontend-lemon.vercel.app"
+    assert res.headers.get("Access-Control-Allow-Credentials") == "true"
+
+    # GET request with untrusted origin
+    evil_res = client.get("/health", headers={"Origin": "https://malicious-attacker.com"})
+    assert evil_res.status_code == 200
+    assert "Access-Control-Allow-Origin" not in evil_res.headers
+
+
+def test_cross_origin_csrf_validation_with_vercel_origin():
+    csrf_app = create_app({
+        "TESTING": True,
+        "SECRET_KEY": "csrf-test-key-cross-origin",
+        "SQLALCHEMY_DATABASE_URI": "sqlite://",
+        "WTF_CSRF_ENABLED": True,
+        "FRONTEND_URL": "https://trustvault-frontend-lemon.vercel.app",
+        "BACKEND_URL": "https://trustvault-backend-hfpk.onrender.com",
+    })
+    with csrf_app.app_context():
+        db.create_all()
+    client = csrf_app.test_client()
+
+    # Fetch CSRF token
+    token_res = client.get("/csrf-token", headers={"Origin": "https://trustvault-frontend-lemon.vercel.app"})
+    assert token_res.status_code == 200
+    token = token_res.get_json()["csrf_token"]
+
+    # Post from allowed Vercel frontend with CSRF token should succeed (not fail with referrer mismatch)
+    register_res = client.post(
+        "/register",
+        json={
+            "email": "crossorigin@example.com",
+            "password": PASSWORD,
+            "company_name": "Cross Origin Workspace",
+        },
+        headers={
+            "X-CSRFToken": token,
+            "Origin": "https://trustvault-frontend-lemon.vercel.app",
+            "Referer": "https://trustvault-frontend-lemon.vercel.app/",
+        },
+    )
+    assert register_res.status_code == 201
+
+    # Post with invalid CSRF token should be rejected
+    bad_token_res = client.post(
+        "/register",
+        json={
+            "email": "fail@example.com",
+            "password": PASSWORD,
+            "company_name": "Fail Workspace",
+        },
+        headers={
+            "X-CSRFToken": "invalid-csrf-token",
+            "Origin": "https://trustvault-frontend-lemon.vercel.app",
+        },
+    )
+    assert bad_token_res.status_code == 400
+    assert bad_token_res.get_json()["error"] == "CSRF validation failed"
+
+
+def test_untrusted_origin_csrf_is_blocked():
+    csrf_app = create_app({
+        "TESTING": True,
+        "SECRET_KEY": "csrf-test-key-untrusted",
+        "SQLALCHEMY_DATABASE_URI": "sqlite://",
+        "WTF_CSRF_ENABLED": True,
+        "FRONTEND_URL": "https://trustvault-frontend-lemon.vercel.app",
+    })
+    client = csrf_app.test_client()
+    token = client.get("/csrf-token").get_json()["csrf_token"]
+
+    res = client.post(
+        "/forgot-password",
+        json={"email": "victim@example.com"},
+        headers={
+            "X-CSRFToken": token,
+            "Origin": "https://malicious-site.com",
+        },
+    )
+    assert res.status_code == 400
+    assert res.get_json()["error"] == "CSRF validation failed"
+
+
+def test_oauth_unconfigured_error_redirects_are_absolute():
+    oauth_app = create_app({
+        "TESTING": True,
+        "SECRET_KEY": "oauth-test-key",
+        "SQLALCHEMY_DATABASE_URI": "sqlite://",
+        "FRONTEND_URL": "trustvault-frontend-lemon.vercel.app",  # provided without scheme
+        "BACKEND_URL": "trustvault-backend-hfpk.onrender.com",
+        "GOOGLE_CLIENT_ID": "",
+        "GOOGLE_CLIENT_SECRET": "",
+    })
+    client = oauth_app.test_client()
+
+    # /auth/google should redirect to absolute frontend URL
+    res = client.get("/auth/google")
+    assert res.status_code == 302
+    assert res.headers["Location"] == "https://trustvault-frontend-lemon.vercel.app/?oauth_error=not_configured"
+
+    # /auth/google/callback should redirect to absolute frontend URL
+    cb_res = client.get("/auth/google/callback")
+    assert cb_res.status_code == 302
+    assert cb_res.headers["Location"] == "https://trustvault-frontend-lemon.vercel.app/?oauth_error=not_configured"
+
+
+def test_oauth_failure_redirect_does_not_create_malformed_url(monkeypatch):
+    oauth_app = create_app({
+        "TESTING": True,
+        "SECRET_KEY": "oauth-test-key",
+        "SQLALCHEMY_DATABASE_URI": "sqlite://",
+        "FRONTEND_URL": "trustvault-frontend-n135yxdoq-dasari-chaitanya-sai-ganesh.vercel.app",
+        "BACKEND_URL": "https://trustvault-backend-hfpk.onrender.com",
+        "GOOGLE_CLIENT_ID": "dummy-client-id",
+        "GOOGLE_CLIENT_SECRET": "dummy-client-secret",
+    })
+    client = oauth_app.test_client()
+
+    # Even when authorize_access_token throws, redirect must be valid absolute URL
+    cb_res = client.get("/auth/google/callback")
+    assert cb_res.status_code == 302
+    location = cb_res.headers["Location"]
+    assert location.startswith("https://trustvault-frontend-n135yxdoq-dasari-chaitanya-sai-ganesh.vercel.app/")
+    assert "oauth_error=" in location
+    # Verify no malformed duplicate paths
+    assert "/auth/google/trustvault" not in location
+
+
+def test_cookie_attributes_in_production_https_mode():
+    prod_app = create_app({
+        "TESTING": True,
+        "SECRET_KEY": "cookie-test-key",
+        "SQLALCHEMY_DATABASE_URI": "sqlite://",
+        "FRONTEND_URL": "https://trustvault-frontend-lemon.vercel.app",
+        "BACKEND_URL": "https://trustvault-backend-hfpk.onrender.com",
+    })
+    assert prod_app.config["SESSION_COOKIE_SAMESITE"] == "None"
+    assert prod_app.config["SESSION_COOKIE_SECURE"] is True
+    assert prod_app.config["REMEMBER_COOKIE_SECURE"] is True
+    assert prod_app.config["WTF_CSRF_SSL_STRICT"] is False

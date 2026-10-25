@@ -14,3 +14,4 @@ instance/
 private_uploads/
 node_modules/
 dist/
+*.tsbuildinfo

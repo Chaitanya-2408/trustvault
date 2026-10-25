@@ -2,13 +2,15 @@ import os
 import secrets
 import hashlib
 import hmac
+import re
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from pathlib import Path
 
 from flask import send_file, redirect, url_for
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from functools import wraps
 
@@ -42,6 +44,35 @@ from backend.models import (
 load_dotenv()
 
 
+def _normalize_url(url: str, default_scheme: str = "https") -> str:
+    if not url:
+        return ""
+    url = url.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        url = f"{default_scheme}://{url}"
+    return url.rstrip("/")
+
+
+def _is_allowed_origin(origin: str, frontend_url: str = "") -> bool:
+    if not origin:
+        return False
+    origin = origin.strip().rstrip("/")
+    if frontend_url and origin.lower() == frontend_url.strip().rstrip("/").lower():
+        return True
+    if origin.lower() in (
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5000",
+        "http://127.0.0.1:5000",
+        "https://trustvault-frontend-lemon.vercel.app",
+    ):
+        return True
+    # Allow any TrustVault Vercel deployment/preview subdomain
+    if re.match(r"^https:\/\/trustvault-frontend(-[a-z0-9\-]+)?\.vercel\.app$", origin, re.IGNORECASE):
+        return True
+    return False
+
+
 def create_app(test_config=None):
     app = Flask(__name__)
 
@@ -52,11 +83,41 @@ def create_app(test_config=None):
     )
     os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
-    # Cross-site session cookies must be Secure when the frontend is HTTPS.
-    # COOKIE_SECURE can explicitly override this default in the environment.
-    frontend_url_env = os.environ.get("FRONTEND_URL", "http://localhost:5173")
-    default_cookie_secure = "true" if frontend_url_env.startswith("https://") else "false"
-    cookie_secure = os.environ.get("COOKIE_SECURE", default_cookie_secure).lower() == "true"
+    raw_frontend = ""
+    raw_backend = ""
+    if test_config:
+        raw_frontend = test_config.get("FRONTEND_URL", "")
+        raw_backend = test_config.get("BACKEND_URL", "")
+    if not raw_frontend:
+        raw_frontend = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+    if not raw_backend:
+        raw_backend = os.environ.get("BACKEND_URL", "http://localhost:5000")
+
+    frontend_default_scheme = "https" if "vercel.app" in raw_frontend else "http"
+    backend_default_scheme = "https" if "onrender.com" in raw_backend else "http"
+
+    frontend_url = _normalize_url(raw_frontend, default_scheme=frontend_default_scheme)
+    backend_url = _normalize_url(raw_backend, default_scheme=backend_default_scheme)
+
+    is_production_https = frontend_url.startswith("https://") or backend_url.startswith("https://")
+    default_cookie_secure = "true" if is_production_https else "false"
+    cookie_secure_raw = None
+    if test_config and "COOKIE_SECURE" in test_config:
+        cookie_secure_raw = str(test_config["COOKIE_SECURE"])
+    if cookie_secure_raw is None:
+        cookie_secure_raw = os.environ.get("COOKIE_SECURE", default_cookie_secure)
+    cookie_secure = str(cookie_secure_raw).lower() == "true"
+
+    default_samesite = "None" if is_production_https else "Lax"
+    configured_samesite = None
+    if test_config and "SESSION_COOKIE_SAMESITE" in test_config:
+        configured_samesite = test_config["SESSION_COOKIE_SAMESITE"]
+    if not configured_samesite:
+        configured_samesite = os.environ.get("SESSION_COOKIE_SAMESITE", default_samesite)
+
+    # Modern browsers reject SameSite=None cookies unless Secure is True
+    if configured_samesite.lower() == "none" and not cookie_secure:
+        cookie_secure = True
 
     app.config.update(
         SECRET_KEY=os.environ.get("SECRET_KEY"),
@@ -66,14 +127,14 @@ def create_app(test_config=None):
         ),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE=os.environ.get(
-            "SESSION_COOKIE_SAMESITE",
-            "None" if os.environ.get("FRONTEND_URL", "").startswith("https://") else "Lax",
-        ),
+        SESSION_COOKIE_SAMESITE=configured_samesite,
         SESSION_COOKIE_SECURE=cookie_secure,
+        SESSION_COOKIE_PATH="/",
         REMEMBER_COOKIE_HTTPONLY=True,
         REMEMBER_COOKIE_SECURE=cookie_secure,
-
+        REMEMBER_COOKIE_SAMESITE=configured_samesite,
+        WTF_CSRF_SSL_STRICT=False,
+        WTF_CSRF_TIME_LIMIT=3600 * 24,
 
         MAIL_SERVER=os.environ.get("MAIL_SERVER", ""),
         MAIL_PORT=int(os.environ.get("MAIL_PORT", "587")),
@@ -93,42 +154,51 @@ def create_app(test_config=None):
         ).lower() == "true",
         GOOGLE_CLIENT_ID=os.environ.get("GOOGLE_CLIENT_ID", ""),
         GOOGLE_CLIENT_SECRET=os.environ.get("GOOGLE_CLIENT_SECRET", ""),
-        FRONTEND_URL=os.environ.get("FRONTEND_URL", "http://localhost:5173"),
-        BACKEND_URL=os.environ.get("BACKEND_URL", "http://localhost:5000"),
+        FRONTEND_URL=frontend_url,
+        BACKEND_URL=backend_url,
         INVITATION_TTL_HOURS=int(os.environ.get("INVITATION_TTL_HOURS", "48")),
         JOIN_REQUEST_TTL_HOURS=int(os.environ.get("JOIN_REQUEST_TTL_HOURS", "72")),
-
     )
 
     if test_config:
         app.config.update(test_config)
+        app.config["FRONTEND_URL"] = _normalize_url(app.config.get("FRONTEND_URL", ""), default_scheme=frontend_default_scheme)
+        app.config["BACKEND_URL"] = _normalize_url(app.config.get("BACKEND_URL", ""), default_scheme=backend_default_scheme)
+        if "SESSION_COOKIE_SAMESITE" not in test_config:
+            app.config["SESSION_COOKIE_SAMESITE"] = configured_samesite
+        if "SESSION_COOKIE_SECURE" not in test_config:
+            app.config["SESSION_COOKIE_SECURE"] = cookie_secure
         if app.config.get("TESTING") and "MAIL_SUPPRESS_SEND" not in test_config:
             app.config["MAIL_SUPPRESS_SEND"] = True
 
-    # Cross-origin browser requests from the deployed frontend.
-    # Keep the allowlist limited to the configured frontend origin.
-    frontend_origin = app.config.get("FRONTEND_URL", "").rstrip("/")
-    if frontend_origin:
-        app.config["WTF_CSRF_TRUSTED_ORIGINS"] = list(
-            dict.fromkeys(
-                list(app.config.get("WTF_CSRF_TRUSTED_ORIGINS", []))
-                + [frontend_origin]
-            )
-        )
+    @app.before_request
+    def validate_request_origin():
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            origin = request.headers.get("Origin")
+            referer = request.headers.get("Referer")
+            allowed_frontend = app.config.get("FRONTEND_URL", "")
+            if origin:
+                if not _is_allowed_origin(origin, allowed_frontend) and origin.rstrip("/") != request.host_url.rstrip("/"):
+                    return jsonify({"error": "CSRF validation failed", "description": "Origin not allowed"}), 400
+            elif referer:
+                ref_parsed = urlparse(referer)
+                ref_origin = f"{ref_parsed.scheme}://{ref_parsed.netloc}"
+                if not _is_allowed_origin(ref_origin, allowed_frontend) and ref_origin.rstrip("/") != request.host_url.rstrip("/"):
+                    return jsonify({"error": "CSRF validation failed", "description": "Referer not allowed"}), 400
 
     @app.after_request
     def add_cors_headers(response):
         origin = request.headers.get("Origin")
-        allowed_origin = app.config.get("FRONTEND_URL", "").rstrip("/")
+        allowed_frontend = app.config.get("FRONTEND_URL", "")
 
-        if origin and allowed_origin and origin.rstrip("/") == allowed_origin:
+        if origin and _is_allowed_origin(origin, allowed_frontend):
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Credentials"] = "true"
             response.headers["Access-Control-Allow-Methods"] = (
                 "GET, POST, PUT, PATCH, DELETE, OPTIONS"
             )
             response.headers["Access-Control-Allow-Headers"] = (
-                "Content-Type, X-CSRFToken, X-CSRF-Token"
+                "Content-Type, X-CSRFToken, X-CSRF-Token, Authorization, Accept"
             )
             response.headers["Access-Control-Expose-Headers"] = "Content-Disposition"
             response.headers["Vary"] = "Origin"
@@ -536,21 +606,26 @@ def create_app(test_config=None):
     
     @app.get("/auth/google")
     def google_login():
+        frontend_url = app.config["FRONTEND_URL"].rstrip("/")
         if (
-        not app.config.get("GOOGLE_CLIENT_ID")
-        or not app.config.get("GOOGLE_CLIENT_SECRET")
+            not app.config.get("GOOGLE_CLIENT_ID")
+            or not app.config.get("GOOGLE_CLIENT_SECRET")
         ):
-            return redirect(
-            app.config["FRONTEND_URL"].rstrip("/")
-            + "/?oauth_error=not_configured"
-            )
+            return redirect(f"{frontend_url}/?oauth_error=not_configured")
 
         google = oauth.create_client("google")
         if google is None:
-            return redirect(
-            app.config["FRONTEND_URL"].rstrip("/")
-            + "/?oauth_error=not_configured"
-            )
+            return redirect(f"{frontend_url}/?oauth_error=not_configured")
+
+        # Remember which frontend URL initiated OAuth (e.g. preview deployment or production)
+        return_to = request.args.get("return_to", "").strip().rstrip("/")
+        if return_to and _is_allowed_origin(return_to, frontend_url):
+            session["oauth_frontend_url"] = return_to
+        elif request.referrer:
+            ref_parsed = urlparse(request.referrer)
+            ref_origin = f"{ref_parsed.scheme}://{ref_parsed.netloc}".rstrip("/")
+            if _is_allowed_origin(ref_origin, frontend_url):
+                session["oauth_frontend_url"] = ref_origin
 
         callback = (
             app.config["BACKEND_URL"].rstrip("/")
@@ -558,12 +633,16 @@ def create_app(test_config=None):
         )
         return google.authorize_redirect(callback)
 
-
     @app.get("/auth/google/callback")
     def google_callback():
+        frontend_url = app.config["FRONTEND_URL"].rstrip("/")
+        frontend_base = session.pop("oauth_frontend_url", None) or frontend_url
+        if not _is_allowed_origin(frontend_base, frontend_url):
+            frontend_base = frontend_url
+
         google = oauth.create_client("google")
         if google is None:
-            return redirect(app.config["FRONTEND_URL"].rstrip("/") + "/?oauth_error=not_configured")
+            return redirect(f"{frontend_base}/?oauth_error=not_configured")
         try:
             token = google.authorize_access_token()
             info = token.get("userinfo")
@@ -572,11 +651,11 @@ def create_app(test_config=None):
                 info = userinfo_response.json() if hasattr(userinfo_response, "json") else userinfo_response
         except Exception:
             app.logger.exception("Google OAuth callback failed")
-            return redirect(app.config["FRONTEND_URL"].rstrip("/") + "/?oauth_error=sign_in_failed")
+            return redirect(f"{frontend_base}/?oauth_error=sign_in_failed")
         email = (info.get("email") or "").strip().lower()
         verified = info.get("email_verified") is True or str(info.get("email_verified", "")).lower() == "true"
         if not email or not verified:
-            return redirect(app.config["FRONTEND_URL"].rstrip("/") + "/?oauth_error=email_not_verified")
+            return redirect(f"{frontend_base}/?oauth_error=email_not_verified")
         user = db.session.execute(db.select(User).filter_by(email=email)).scalar_one_or_none()
         if user is None:
             user = User(email=email, password_hash=None, role="viewer")
@@ -587,13 +666,13 @@ def create_app(test_config=None):
                 db.session.rollback()
                 user = db.session.execute(db.select(User).filter_by(email=email)).scalar_one_or_none()
                 if user is None:
-                    return redirect(app.config["FRONTEND_URL"].rstrip("/") + "/?oauth_error=account_failed")
+                    return redirect(f"{frontend_base}/?oauth_error=account_failed")
         login_user(user)
         session.pop("active_company_id", None)
         memberships = db.session.execute(db.select(CompanyMembership).filter_by(user_id=user.id)).scalars().all()
         if len(memberships) == 1:
             session["active_company_id"] = memberships[0].company_id
-        target = app.config["FRONTEND_URL"].rstrip("/") + "/?oauth=success"
+        target = f"{frontend_base}/?oauth=success"
         if not memberships:
             target += "&setup_workspace=1"
         return redirect(target)
@@ -1882,29 +1961,53 @@ def create_app(test_config=None):
             "pages": pagination.pages,
         }), 200
 
+    # Apply ProxyFix so Flask recognizes https scheme and real host from Render's reverse proxy
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app,
+        x_for=1,
+        x_proto=1,
+        x_host=1,
+        x_prefix=1,
+    )
+
     # Final WSGI-level CORS enforcement. This wraps every Flask response,
-    # including automatic OPTIONS responses and error/unauthorized responses.
-    # It intentionally allows only the configured frontend origin.
+    # including preflight OPTIONS responses, redirects, and error/unauthorized responses.
     flask_wsgi_app = app.wsgi_app
 
     def cors_wsgi_app(environ, start_response):
         origin = environ.get("HTTP_ORIGIN", "")
-        allowed_origin = app.config.get("FRONTEND_URL", "").rstrip("/")
+        method = environ.get("REQUEST_METHOD", "")
+        allowed = _is_allowed_origin(origin, app.config.get("FRONTEND_URL", ""))
+
+        if method == "OPTIONS" and allowed:
+            headers = [
+                ("Access-Control-Allow-Origin", origin),
+                ("Access-Control-Allow-Credentials", "true"),
+                ("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+                ("Access-Control-Allow-Headers", "Content-Type, X-CSRFToken, X-CSRF-Token, Authorization, Accept"),
+                ("Access-Control-Expose-Headers", "Content-Disposition"),
+                ("Access-Control-Max-Age", "86400"),
+                ("Vary", "Origin"),
+                ("Content-Length", "0"),
+                ("Content-Type", "text/plain"),
+            ]
+            start_response("204 No Content", headers)
+            return [b""]
 
         def cors_start_response(status, headers, exc_info=None):
-            if origin and allowed_origin and origin.rstrip("/") == allowed_origin:
+            if allowed:
                 cors_headers = {
                     "access-control-allow-origin": origin,
                     "access-control-allow-credentials": "true",
                     "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-                    "access-control-allow-headers": "Content-Type, X-CSRFToken, X-CSRF-Token",
+                    "access-control-allow-headers": "Content-Type, X-CSRFToken, X-CSRF-Token, Authorization, Accept",
                     "access-control-expose-headers": "Content-Disposition",
                 }
                 headers = [
                     (key, value) for key, value in headers
                     if key.lower() not in cors_headers and key.lower() != "vary"
                 ]
-                headers.extend((key, value) for key, value in cors_headers.items())
+                headers.extend((key.title(), value) for key, value in cors_headers.items())
                 headers.append(("Vary", "Origin"))
             return start_response(status, headers, exc_info)
 

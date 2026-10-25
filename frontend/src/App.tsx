@@ -16,13 +16,21 @@ type JoinRequest = { id: number; email: string; role: string; created_at: string
 type InvitationInfo = { email: string; company_name: string; role: string };
 type Tab = "documents" | "members" | "audit";
 
-// Set VITE_API_BASE_URL in production (for example, the Render backend URL).
-// Locally, the empty default keeps using the Vite development proxy.
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+// Backend base URL for production Render deployment.
+const PROD_BACKEND_URL = "https://trustvault-backend-hfpk.onrender.com";
+
+// Use configured VITE_API_BASE_URL, or fallback to direct Render backend in production.
+// In Vite development (import.meta.env.DEV), default to "" to use the local Vite proxy.
+const API_BASE_URL = (
+  import.meta.env.VITE_API_BASE_URL ||
+  (import.meta.env.DEV ? "" : PROD_BACKEND_URL)
+).replace(/\/$/, "");
 
 // OAuth must start on the backend origin so the same Render session cookie
-// is available to /auth/google/callback. Do not route this through Vercel.
-const GOOGLE_AUTH_BASE_URL = "https://trustvault-backend-hfpk.onrender.com";
+// is available to /auth/google/callback.
+const GOOGLE_AUTH_BASE_URL = (
+  API_BASE_URL || PROD_BACKEND_URL
+).replace(/\/$/, "");
 
 let csrfToken = "";
 async function getCsrfToken() {
@@ -427,7 +435,10 @@ function App() {
           <p className="muted">{authStep === "login-otp" ? `Enter the 6-digit code sent to ${email}.` : authStep === "forgot" ? "Enter your account email and we’ll send reset instructions if an account exists." : authStep === "reset" ? "Enter the code from your email and choose a strong new password." : "Share important files with confidence, clear permissions, and a verifiable audit trail."}</p>
           {authStep === "credentials" && <>
             <div className="auth-toggle"><button type="button" className={authMode === "login" ? "active" : ""} onClick={() => { setAuthMode("login"); setError(""); setMessage(""); }}>Sign in</button><button type="button" className={authMode === "register" ? "active" : ""} onClick={() => { setAuthMode("register"); setError(""); setMessage(""); }}>Create account</button></div>
-            <button className="secondary google-button" type="button" onClick={() => { window.location.href = `${GOOGLE_AUTH_BASE_URL}/auth/google`; }}>Continue with Google</button>
+            <button className="secondary google-button" type="button" onClick={() => {
+              const returnParam = encodeURIComponent(window.location.origin);
+              window.location.href = `${GOOGLE_AUTH_BASE_URL}/auth/google?return_to=${returnParam}`;
+            }}>Continue with Google</button>
             <p className="muted auth-separator">or continue with email</p>
             <form onSubmit={submitAuth} className="stack">
               <label>Email address<input type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} required placeholder="you@company.com" /></label>
