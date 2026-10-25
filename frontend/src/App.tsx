@@ -216,12 +216,17 @@ function App() {
         setPassword("");
         return;
       }
-      const result = await api<{ message: string; challenge_id: string }>("/login", { method: "POST", body: JSON.stringify({ email, password }) });
+      const result = await api<{ message: string; challenge_id: string; demo_otp?: string }>("/login", { method: "POST", body: JSON.stringify({ email, password }) });
       setChallengeId(result.challenge_id);
-      setOtp("");
+      if (result.demo_otp) {
+        setOtp(result.demo_otp);
+        setMessage(result.message || `Demo OTP: ${result.demo_otp}`);
+      } else {
+        setOtp("");
+        setMessage(result.message || "We sent a verification code to your email. It expires in 5 minutes.");
+      }
       setPassword("");
       setAuthStep("login-otp");
-      setMessage("We sent a verification code to your email. It expires in 5 minutes.");
     });
   }
 
@@ -236,16 +241,28 @@ function App() {
 
   async function resendLoginOtp() {
     await runAction(async () => {
-      const result = await api<{ challenge_id: string; message: string }>("/login/resend-otp", { method: "POST", body: JSON.stringify({ challenge_id: challengeId }) });
-      setChallengeId(result.challenge_id); setOtp(""); setMessage(result.message);
+      const result = await api<{ challenge_id: string; message: string; demo_otp?: string }>("/login/resend-otp", { method: "POST", body: JSON.stringify({ challenge_id: challengeId }) });
+      setChallengeId(result.challenge_id);
+      if (result.demo_otp) {
+        setOtp(result.demo_otp);
+      } else {
+        setOtp("");
+      }
+      setMessage(result.message);
     });
   }
 
   async function requestPasswordReset(event: FormEvent) {
     event.preventDefault();
     await runAction(async () => {
-      const result = await api<{ challenge_id: string; message: string }>("/forgot-password", { method: "POST", body: JSON.stringify({ email }) });
-      setChallengeId(result.challenge_id); setOtp(""); setAuthStep("reset"); setMessage(result.message);
+      const result = await api<{ challenge_id: string; message: string; demo_otp?: string }>("/forgot-password", { method: "POST", body: JSON.stringify({ email }) });
+      setChallengeId(result.challenge_id);
+      if (result.demo_otp) {
+        setOtp(result.demo_otp);
+      } else {
+        setOtp("");
+      }
+      setAuthStep("reset"); setMessage(result.message);
       // The same next step is shown regardless of whether the email is registered.
     });
   }

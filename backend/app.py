@@ -552,8 +552,26 @@ def create_app(test_config=None):
         db.session.add(row)
         db.session.commit()
         label = "sign-in" if purpose == "login" else "password reset"
-        send_email(user.email, f"TrustVault {label} verification code", f"Your TrustVault {label} code is {code}. It expires in 5 minutes. If you did not request this, you can ignore this email.")
-        result = {"message": "Verification code sent to your email.", "challenge_id": challenge_token, "expires_in": 300}
+        email_sent = False
+        try:
+            send_email(
+                user.email,
+                f"TrustVault {label} verification code",
+                f"Your TrustVault {label} code is {code}. It expires in 5 minutes. If you did not request this, you can ignore this email.",
+            )
+            email_sent = True
+        except RuntimeError as e:
+            app.logger.warning("Email delivery suppressed or unconfigured: %s. Generated OTP for %s: %s", e, user.email, code)
+        except Exception:
+            app.logger.exception("Failed to send OTP email to %s", user.email)
+
+        result = {
+            "message": "Verification code sent to your email." if email_sent else f"SMTP is not configured on server. Demo verification code: {code}",
+            "challenge_id": challenge_token,
+            "expires_in": 300,
+        }
+        if not email_sent:
+            result["demo_otp"] = code
         # Test-only convenience; never return a code in a real environment.
         if app.testing:
             result["test_otp"] = code
