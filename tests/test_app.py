@@ -1280,3 +1280,55 @@ def test_cookie_attributes_in_production_https_mode():
     assert prod_app.config["SESSION_COOKIE_SECURE"] is True
     assert prod_app.config["REMEMBER_COOKIE_SECURE"] is True
     assert prod_app.config["WTF_CSRF_SSL_STRICT"] is False
+
+
+def test_oauth_session_token_exchange_establishes_authenticated_session(client):
+    from backend.models import db, User, LoginOTP
+    from datetime import datetime, timedelta
+    import secrets
+    import hashlib
+
+    # Create a user
+    with client.application.app_context():
+        user = User(email="oauth-user@example.com", role="viewer")
+        db.session.add(user)
+        db.session.commit()
+        user_id = user.id
+
+        raw_token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        otp = LoginOTP(
+            user_id=user_id,
+            challenge_hash=digest,
+            otp_hash="oauth",
+            purpose="oauth",
+            expires_at=datetime.utcnow() + timedelta(minutes=2),
+            attempts=0,
+        )
+        db.session.add(otp)
+        db.session.commit()
+
+    # Before exchange, /me is unauthorized
+    assert client.get("/me").status_code == 401
+
+    # Exchange token
+    res = client.post("/auth/session", json={"token": raw_token})
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["email"] == "oauth-user@example.com"
+    assert data["id"] == user_id
+
+    # After exchange, /me is now authorized and returns 200
+    me_res = client.get("/me")
+    assert me_res.status_code == 200
+    assert me_res.get_json()["email"] == "oauth-user@example.com"
+
+    # Token is single-use and cannot be exchanged again
+    reuse_res = client.post("/auth/session", json={"token": raw_token})
+    assert reuse_res.status_code == 400
+
+
+def test_invalid_oauth_session_token_fails(client):
+    res = client.post("/auth/session", json={"token": "completely-invalid-token"})
+    assert res.status_code == 400
+    assert res.get_json()["error"] == "Invalid or expired session token"

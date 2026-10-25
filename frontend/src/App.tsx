@@ -16,21 +16,13 @@ type JoinRequest = { id: number; email: string; role: string; created_at: string
 type InvitationInfo = { email: string; company_name: string; role: string };
 type Tab = "documents" | "members" | "audit";
 
-// Backend base URL for production Render deployment.
-const PROD_BACKEND_URL = "https://trustvault-backend-hfpk.onrender.com";
+// Option 1 (Recommended): Same-origin Vercel proxy.
+// All API requests route through Vercel's rewrite rules to Render.
+// If VITE_API_BASE_URL is explicitly set in the environment, it will be used instead.
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 
-// Use configured VITE_API_BASE_URL, or fallback to direct Render backend in production.
-// In Vite development (import.meta.env.DEV), default to "" to use the local Vite proxy.
-const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL ||
-  (import.meta.env.DEV ? "" : PROD_BACKEND_URL)
-).replace(/\/$/, "");
-
-// OAuth must start on the backend origin so the same Render session cookie
-// is available to /auth/google/callback.
-const GOOGLE_AUTH_BASE_URL = (
-  API_BASE_URL || PROD_BACKEND_URL
-).replace(/\/$/, "");
+// OAuth starts directly on Render so session cookies align with the Google redirect URI callback.
+const GOOGLE_AUTH_BASE_URL = "https://trustvault-backend-hfpk.onrender.com";
 
 let csrfToken = "";
 async function getCsrfToken() {
@@ -124,22 +116,59 @@ function App() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    if (params.get("oauth") === "success") setMessage("Google sign-in successful.");
-    if (params.get("oauth_error")) setError(`Google sign-in could not complete: ${params.get("oauth_error")}. You can still use email and password.`);
+    const oauthToken = params.get("oauth_token");
+
+    if (oauthToken) {
+      setBusy(true);
+      api<User>("/auth/session", {
+        method: "POST",
+        body: JSON.stringify({ token: oauthToken }),
+      })
+        .then((me) => {
+          setUser(me);
+          setCompanies(me.companies || []);
+          setActiveCompanyId(me.active_company_id);
+          setMessage("Google sign-in successful.");
+          setError("");
+        })
+        .catch((e: Error) => {
+          setError(`Google sign-in could not complete: ${e.message}`);
+        })
+        .finally(() => {
+          setBusy(false);
+        });
+    } else if (params.get("oauth") === "success") {
+      refreshMe()
+        .then(() => setMessage("Google sign-in successful."))
+        .catch(() => {});
+    }
+
+    if (params.get("oauth_error")) {
+      setError(`Google sign-in could not complete: ${params.get("oauth_error")}. You can still use email and password.`);
+    }
+
     if (inviteToken) {
       api<InvitationInfo>(`/invites/validate?token=${encodeURIComponent(inviteToken)}`)
         .then(setInviteInfo)
         .catch((e: Error) => setError(e.message));
     }
-    if (params.has("oauth") || params.has("oauth_error") || params.has("setup_workspace")) {
+
+    if (params.has("oauth") || params.has("oauth_token") || params.has("oauth_error") || params.has("setup_workspace")) {
       window.history.replaceState({}, document.title, window.location.pathname);
     }
-  }, [inviteToken]);
+  }, [inviteToken, refreshMe]);
 
   useEffect(() => {
-    api<User>("/me").then((me) => {
-      setUser(me); setCompanies(me.companies || []); setActiveCompanyId(me.active_company_id);
-    }).catch(() => setUser(null));
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("oauth_token")) {
+      api<User>("/me")
+        .then((me) => {
+          setUser(me);
+          setCompanies(me.companies || []);
+          setActiveCompanyId(me.active_company_id);
+        })
+        .catch(() => setUser(null));
+    }
   }, []);
 
   useEffect(() => {

@@ -672,10 +672,85 @@ def create_app(test_config=None):
         memberships = db.session.execute(db.select(CompanyMembership).filter_by(user_id=user.id)).scalars().all()
         if len(memberships) == 1:
             session["active_company_id"] = memberships[0].company_id
-        target = f"{frontend_base}/?oauth=success"
+
+        # Generate a single-use exchange token so the frontend can securely
+        # establish its session cookie on whichever origin context it uses (Vercel proxy or direct).
+        exchange_token = secrets.token_urlsafe(32)
+        now = datetime.utcnow()
+        LoginOTP.query.filter_by(user_id=user.id, purpose="oauth", consumed_at=None).update({"consumed_at": now})
+        otp_row = LoginOTP(
+            user_id=user.id,
+            challenge_hash=hashlib.sha256(exchange_token.encode("utf-8")).hexdigest(),
+            otp_hash="oauth",
+            purpose="oauth",
+            expires_at=now + timedelta(minutes=2),
+            attempts=0,
+        )
+        db.session.add(otp_row)
+        db.session.commit()
+
+        target = f"{frontend_base}/?oauth=success&oauth_token={exchange_token}"
         if not memberships:
             target += "&setup_workspace=1"
         return redirect(target)
+
+    @app.post("/auth/session")
+    @csrf.exempt
+    def exchange_oauth_session():
+        data = request.get_json(silent=True) or {}
+        token = data.get("token")
+        if not isinstance(token, str) or not token:
+            return jsonify({"error": "Token is required"}), 400
+
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        now = datetime.utcnow()
+        row = LoginOTP.query.filter_by(challenge_hash=digest, purpose="oauth").first()
+        if row is None or row.consumed_at is not None or row.expires_at <= now:
+            return jsonify({"error": "Invalid or expired session token"}), 400
+
+        row.consumed_at = now
+        user = db.session.get(User, row.user_id)
+        if user is None:
+            db.session.commit()
+            return jsonify({"error": "Account not found"}), 400
+        db.session.commit()
+
+        login_user(user)
+        session.pop("active_company_id", None)
+        memberships = db.session.execute(db.select(CompanyMembership).filter_by(user_id=user.id)).scalars().all()
+        if len(memberships) == 1:
+            session["active_company_id"] = memberships[0].company_id
+
+        log_audit_event(
+            action="LOGIN_GOOGLE_OAUTH",
+            outcome="SUCCESS",
+            actor_user_id=user.id,
+            actor_email=user.email,
+            details={"method": "google_oauth_exchange"},
+        )
+
+        memberships_with_company = db.session.execute(
+            db.select(CompanyMembership, Company)
+            .join(Company, CompanyMembership.company_id == Company.id)
+            .filter(CompanyMembership.user_id == user.id)
+        ).all()
+        companies_data = [
+            {
+                "id": comp.id,
+                "name": comp.name,
+                "role": mem.role,
+                "active": comp.id == session.get("active_company_id"),
+                "is_owner": comp.owner_user_id == user.id,
+            }
+            for mem, comp in memberships_with_company
+        ]
+        return jsonify({
+            "id": user.id,
+            "email": user.email,
+            "role": user.role,
+            "active_company_id": session.get("active_company_id"),
+            "companies": companies_data,
+        }), 200
 
     @app.post("/companies")
     @login_required
