@@ -1,0 +1,26 @@
+{
+  "rewrites": [
+    { "source": "/health", "destination": "https://trustvault-backend-hfpk.onrender.com/health" },
+    { "source": "/cors-debug", "destination": "https://trustvault-backend-hfpk.onrender.com/cors-debug" },
+    { "source": "/csrf-token", "destination": "https://trustvault-backend-hfpk.onrender.com/csrf-token" },
+    { "source": "/register", "destination": "https://trustvault-backend-hfpk.onrender.com/register" },
+    { "source": "/login", "destination": "https://trustvault-backend-hfpk.onrender.com/login" },
+    { "source": "/login/:subpath+", "destination": "https://trustvault-backend-hfpk.onrender.com/login/:subpath+" },
+    { "source": "/forgot-password", "destination": "https://trustvault-backend-hfpk.onrender.com/forgot-password" },
+    { "source": "/reset-password", "destination": "https://trustvault-backend-hfpk.onrender.com/reset-password" },
+    { "source": "/auth", "destination": "https://trustvault-backend-hfpk.onrender.com/auth" },
+    { "source": "/auth/:subpath+", "destination": "https://trustvault-backend-hfpk.onrender.com/auth/:subpath+" },
+    { "source": "/invites", "destination": "https://trustvault-backend-hfpk.onrender.com/invites" },
+    { "source": "/invites/:subpath+", "destination": "https://trustvault-backend-hfpk.onrender.com/invites/:subpath+" },
+    { "source": "/logout", "destination": "https://trustvault-backend-hfpk.onrender.com/logout" },
+    { "source": "/me", "destination": "https://trustvault-backend-hfpk.onrender.com/me" },
+    { "source": "/companies", "destination": "https://trustvault-backend-hfpk.onrender.com/companies" },
+    { "source": "/companies/:subpath+", "destination": "https://trustvault-backend-hfpk.onrender.com/companies/:subpath+" },
+    { "source": "/company", "destination": "https://trustvault-backend-hfpk.onrender.com/company" },
+    { "source": "/company/:subpath+", "destination": "https://trustvault-backend-hfpk.onrender.com/company/:subpath+" },
+    { "source": "/documents", "destination": "https://trustvault-backend-hfpk.onrender.com/documents" },
+    { "source": "/documents/:subpath+", "destination": "https://trustvault-backend-hfpk.onrender.com/documents/:subpath+" },
+    { "source": "/admin", "destination": "https://trustvault-backend-hfpk.onrender.com/admin" },
+    { "source": "/admin/:subpath+", "destination": "https://trustvault-backend-hfpk.onrender.com/admin/:subpath+" }
+  ]
+}

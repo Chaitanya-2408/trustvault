@@ -142,6 +142,7 @@ class CustomOAuth(OAuth):
 
 def create_app(test_config=None):
     app = Flask(__name__)
+    app.url_map.strict_slashes = False
 
     app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB
     app.config["UPLOAD_FOLDER"] = os.path.join(
@@ -182,8 +183,15 @@ def create_app(test_config=None):
     if not configured_samesite:
         configured_samesite = os.environ.get("SESSION_COOKIE_SAMESITE", default_samesite)
 
-    # Modern browsers reject SameSite=None cookies unless Secure is True
-    if configured_samesite.lower() == "none" and not cookie_secure:
+    # In cross-origin production (Vercel frontend + Render backend), cookies must be SameSite=None and Secure=True
+    # so authenticated sessions can be read across origins. Enforce this automatically for HTTPS.
+    is_cross_origin_prod = is_production_https and (
+        frontend_url.rstrip("/") != backend_url.rstrip("/")
+    )
+    if is_cross_origin_prod and not test_config:
+        configured_samesite = "None"
+        cookie_secure = True
+    elif configured_samesite and configured_samesite.lower() == "none" and not cookie_secure:
         cookie_secure = True
 
     app.config.update(
@@ -330,6 +338,9 @@ def create_app(test_config=None):
     def cors_debug():
         return jsonify({
             "frontend_url": app.config.get("FRONTEND_URL"),
+            "version": "1.0.4",
+            "same_site": app.config.get("SESSION_COOKIE_SAMESITE"),
+            "cookie_secure": app.config.get("SESSION_COOKIE_SECURE"),
             "cors_handler_registered": any(
                 getattr(handler, "__name__", "") == "add_cors_headers"
                 for handler in app.after_request_funcs.get(None, [])
