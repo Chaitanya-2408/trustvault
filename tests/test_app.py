@@ -86,14 +86,14 @@ def login(client, email):
     )
     if response.status_code != 200:
         return response
-    payload = response.get_json()
-    # The OTP is exposed only in Flask TESTING mode, allowing the test client
-    # to exercise the real two-step authentication flow without SMTP.
-    return client.post(
-        "/login/verify-otp",
-        json={"challenge_id": payload["challenge_id"], "otp": payload["test_otp"]},
-        headers=csrf_headers(client),
-    )
+    payload = response.get_json() or {}
+    if "challenge_id" in payload:
+        return client.post(
+            "/login/verify-otp",
+            json={"challenge_id": payload["challenge_id"], "otp": payload.get("test_otp", "")},
+            headers=csrf_headers(client),
+        )
+    return response
 
 
 def register_and_login(client, email, company_name=None):
@@ -1061,15 +1061,12 @@ def test_invitation_tokens_expire_and_are_single_use(app, monkeypatch):
     assert client.get(f"/invites/validate?token={token}").status_code == 410
 
 
-def test_login_requires_otp_before_authentication(client):
+def test_direct_login_authenticates_without_otp(client):
     assert register(client, "otp-user@example.com").status_code == 201
     response = client.post("/login", json={"email": "otp-user@example.com", "password": PASSWORD}, headers=csrf_headers(client))
     assert response.status_code == 200
     payload = response.get_json()
-    assert payload.get("challenge_id") and payload.get("test_otp")
-    assert client.get("/me").status_code == 401
-    verified = client.post("/login/verify-otp", json={"challenge_id": payload["challenge_id"], "otp": payload["test_otp"]}, headers=csrf_headers(client))
-    assert verified.status_code == 200
+    assert payload.get("email") == "otp-user@example.com"
     assert client.get("/me").status_code == 200
 
 
@@ -1370,4 +1367,191 @@ def test_oauth_state_persistence_without_session_cookie(app):
         # clear_state_data removes from DB
         integration.clear_state_data(session, test_state)
         assert OAuthState.query.filter_by(state=test_state).first() is None
+
+
+def test_registration_with_full_name_and_me_profile(client):
+    res = client.post(
+        "/register",
+        json={
+            "full_name": "Alice Wonderland",
+            "email": "alice_test@example.com",
+            "password": PASSWORD,
+            "confirm_password": PASSWORD,
+            "company_name": "Wonderland Corp",
+        },
+        headers=csrf_headers(client),
+    )
+    assert res.status_code == 201
+    data = res.get_json()
+    assert data["full_name"] == "Alice Wonderland"
+    assert data["email"] == "alice_test@example.com"
+
+    me = client.get("/me").get_json()
+    assert me["full_name"] == "Alice Wonderland"
+    assert me["email"] == "alice_test@example.com"
+    assert len(me["companies"]) == 1
+    assert me["companies"][0]["name"] == "Wonderland Corp"
+    assert me["companies"][0]["is_owner"] is True
+
+
+def test_company_details_and_member_lifecycle(app):
+    owner_client = app.test_client()
+    member_client = app.test_client()
+
+    # Register Owner
+    owner_res = owner_client.post(
+        "/register",
+        json={
+            "full_name": "Owner Person",
+            "email": "owner_lifecycle@example.com",
+            "password": PASSWORD,
+            "confirm_password": PASSWORD,
+            "company_name": "Lifecycle Inc",
+        },
+        headers=csrf_headers(owner_client),
+    )
+    assert owner_res.status_code == 201
+
+    # Register Member (without company)
+    member_res = member_client.post(
+        "/register",
+        json={
+            "full_name": "Bob Member",
+            "email": "bob_lifecycle@example.com",
+            "password": PASSWORD,
+            "confirm_password": PASSWORD,
+        },
+        headers=csrf_headers(member_client),
+    )
+    assert member_res.status_code == 201
+
+    # Check /company/details for owner
+    details_res = owner_client.get("/company/details")
+    assert details_res.status_code == 200
+    details = details_res.get_json()
+    assert details["name"] == "Lifecycle Inc"
+    assert details["is_owner"] is True
+    assert details["current_user_role"] == "admin"
+    assert details["member_count"] == 1
+
+    # Search for bob
+    search_res = owner_client.get("/users/search?q=bob")
+    assert search_res.status_code == 200
+    users = search_res.get_json()["users"]
+    assert any(u["email"] == "bob_lifecycle@example.com" for u in users)
+
+    # Add Bob as viewer
+    add_res = owner_client.post(
+        "/admin/members",
+        json={"email": "bob_lifecycle@example.com", "role": "viewer"},
+        headers=csrf_headers(owner_client),
+    )
+    assert add_res.status_code in (200, 201)
+
+    # Verify members list
+    members_res = owner_client.get("/admin/members")
+    assert members_res.status_code == 200
+    m_list = members_res.get_json()["members"]
+    bob_entry = next((m for m in m_list if m["email"] == "bob_lifecycle@example.com"), None)
+    assert bob_entry is not None
+    assert bob_entry["workspace_role"] == "viewer"
+    assert bob_entry["full_name"] == "Bob Member"
+
+    # Update Bob's role to member
+    patch_res = owner_client.patch(
+        f"/admin/members/{bob_entry['user_id']}",
+        json={"role": "member"},
+        headers=csrf_headers(owner_client),
+    )
+    assert patch_res.status_code == 200
+
+    # Bob switches to Lifecycle Inc
+    bob_me = member_client.get("/me").get_json()
+    comp_id = details["id"]
+    switch_res = member_client.post(
+        "/companies/active",
+        json={"company_id": comp_id},
+        headers=csrf_headers(member_client),
+    )
+    assert switch_res.status_code == 200
+
+    # Bob leaves the company
+    leave_res = member_client.post(
+        "/company/leave",
+        json={},
+        headers=csrf_headers(member_client),
+    )
+    assert leave_res.status_code == 200
+
+    # Bob me profile has 0 companies
+    bob_me_after = member_client.get("/me").get_json()
+    assert len(bob_me_after["companies"]) == 0
+
+
+def test_duplicate_workspace_creation_is_rejected(client, app):
+    # Register first user with "Alpha Beta Corp"
+    res1 = client.post(
+        "/register",
+        json={
+            "full_name": "First Creator",
+            "email": "creator1@example.com",
+            "password": PASSWORD,
+            "confirm_password": PASSWORD,
+            "company_name": "Alpha Beta Corp",
+        },
+        headers=csrf_headers(client),
+    )
+    assert res1.status_code == 201
+
+    # Check-name endpoint confirms "Alpha Beta Corp" is taken
+    check_res = client.get("/companies/check-name?name=Alpha+Beta+Corp")
+    assert check_res.status_code == 200
+    assert check_res.get_json()["available"] is False
+    assert check_res.get_json()["exists"] is True
+
+    # Check-name endpoint confirms unused name is available
+    check_free = client.get("/companies/check-name?name=Gamma+Delta+Corp")
+    assert check_free.status_code == 200
+    assert check_free.get_json()["available"] is True
+
+    # Second user attempts to register creating duplicate workspace with same name
+    client2 = app.test_client()
+    res2 = client2.post(
+        "/register",
+        json={
+            "full_name": "Second Creator",
+            "email": "creator2@example.com",
+            "password": PASSWORD,
+            "confirm_password": PASSWORD,
+            "company_name": "  alpha   beta   corp  ",
+        },
+        headers=csrf_headers(client2),
+    )
+    assert res2.status_code == 409
+    assert "already exists" in res2.get_json()["error"]
+
+    # Logged in user attempts to create workspace with same name via POST /companies
+    # Register creator2 without workspace first
+    res_reg = client2.post(
+        "/register",
+        json={
+            "full_name": "Second Creator",
+            "email": "creator2@example.com",
+            "password": PASSWORD,
+            "confirm_password": PASSWORD,
+        },
+        headers=csrf_headers(client2),
+    )
+    assert res_reg.status_code == 201
+
+    # Try creating workspace with same name
+    create_dup = client2.post(
+        "/companies",
+        json={"name": "Alpha Beta Corp"},
+        headers=csrf_headers(client2),
+    )
+    assert create_dup.status_code == 409
+    assert "already exists" in create_dup.get_json()["error"]
+
+
 
