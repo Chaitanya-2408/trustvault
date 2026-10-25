@@ -22,7 +22,11 @@ type Tab = "documents" | "members" | "audit";
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 
 // OAuth starts directly on Render so session cookies align with the Google redirect URI callback.
-const GOOGLE_AUTH_BASE_URL = "https://trustvault-backend-hfpk.onrender.com";
+const GOOGLE_AUTH_BASE_URL =
+  (import.meta.env.VITE_BACKEND_URL || import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "") ||
+  (typeof window !== "undefined" && window.location.hostname === "localhost"
+    ? "http://localhost:5000"
+    : "https://trustvault-backend-hfpk.onrender.com");
 
 let csrfToken = "";
 async function getCsrfToken() {
@@ -40,7 +44,7 @@ async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
   const method = (init.method || "GET").toUpperCase();
   const headers = new Headers(init.headers || {});
   headers.set("Accept", "application/json");
-  if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+  if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS" && path !== "/auth/session") {
     headers.set("X-CSRFToken", await getCsrfToken());
   }
   if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {

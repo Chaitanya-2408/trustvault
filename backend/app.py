@@ -1,3 +1,4 @@
+import json
 import os
 import secrets
 import hashlib
@@ -15,7 +16,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from functools import wraps
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, session
+from flask import Flask, current_app, jsonify, request, session
 from flask_login import (
     current_user,
     login_required,
@@ -24,7 +25,7 @@ from flask_login import (
 )
 from flask_wtf.csrf import CSRFError, generate_csrf
 from sqlalchemy.exc import IntegrityError
-from authlib.integrations.flask_client import OAuth
+from authlib.integrations.flask_client import OAuth, FlaskIntegration
 
 from backend.audit import log_audit_event
 from backend.email_service import send_email
@@ -39,6 +40,7 @@ from backend.models import (
     WorkspaceInvitation,
     WorkspaceJoinRequest,
     LoginOTP,
+    OAuthState,
 )
 
 load_dotenv()
@@ -71,6 +73,71 @@ def _is_allowed_origin(origin: str, frontend_url: str = "") -> bool:
     if re.match(r"^https:\/\/trustvault-frontend(-[a-z0-9\-]+)?\.vercel\.app$", origin, re.IGNORECASE):
         return True
     return False
+
+
+class DatabaseStateFlaskIntegration(FlaskIntegration):
+    """Authlib Flask integration that persists OAuth state to the database.
+
+    This ensures OAuth callback state validation succeeds even when browser session
+    cookies are dropped, partitioned, or withheld across cross-origin top-level redirects
+    (e.g., between Google accounts, Render, and Vercel).
+    """
+
+    def set_state_data(self, session, state, data):
+        super().set_state_data(session, state, data)
+        try:
+            now = datetime.utcnow()
+            OAuthState.query.filter(OAuthState.expires_at < now).delete()
+            row = OAuthState.query.filter_by(state=state).first()
+            frontend_url = session.get("oauth_frontend_url")
+            payload = json.dumps(data)
+            if not row:
+                row = OAuthState(
+                    state=state,
+                    data=payload,
+                    frontend_url=frontend_url,
+                    expires_at=now + timedelta(minutes=15),
+                )
+                db.session.add(row)
+            else:
+                row.data = payload
+                row.frontend_url = frontend_url
+                row.expires_at = now + timedelta(minutes=15)
+            db.session.commit()
+        except Exception as e:
+            current_app.logger.warning("Could not persist OAuthState: %s", e)
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+
+    def get_state_data(self, session, state):
+        data = super().get_state_data(session, state)
+        if data is not None:
+            return data
+        try:
+            now = datetime.utcnow()
+            row = OAuthState.query.filter_by(state=state).first()
+            if row and row.expires_at >= now:
+                return json.loads(row.data)
+        except Exception as e:
+            current_app.logger.warning("Could not read OAuthState: %s", e)
+        return None
+
+    def clear_state_data(self, session, state):
+        super().clear_state_data(session, state)
+        try:
+            OAuthState.query.filter_by(state=state).delete()
+            db.session.commit()
+        except Exception:
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+
+
+class CustomOAuth(OAuth):
+    framework_integration_cls = DatabaseStateFlaskIntegration
 
 
 def create_app(test_config=None):
@@ -215,7 +282,13 @@ def create_app(test_config=None):
     csrf.init_app(app)
     migrate.init_app(app, db)
 
-    oauth = OAuth(app)
+    with app.app_context():
+        try:
+            OAuthState.__table__.create(db.engine, checkfirst=True)
+        except Exception:
+            pass
+
+    oauth = CustomOAuth(app)
     if app.config.get("GOOGLE_CLIENT_ID") and app.config.get("GOOGLE_CLIENT_SECRET"):
         oauth.register(
             name="google",
@@ -636,7 +709,17 @@ def create_app(test_config=None):
     @app.get("/auth/google/callback")
     def google_callback():
         frontend_url = app.config["FRONTEND_URL"].rstrip("/")
-        frontend_base = session.pop("oauth_frontend_url", None) or frontend_url
+        frontend_base = session.pop("oauth_frontend_url", None)
+        state_param = request.args.get("state")
+        if not frontend_base and state_param:
+            try:
+                state_row = OAuthState.query.filter_by(state=state_param).first()
+                if state_row and state_row.frontend_url:
+                    frontend_base = state_row.frontend_url
+            except Exception:
+                pass
+        if not frontend_base:
+            frontend_base = frontend_url
         if not _is_allowed_origin(frontend_base, frontend_url):
             frontend_base = frontend_url
 

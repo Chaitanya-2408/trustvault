@@ -326,3 +326,16 @@ class LoginOTP(db.Model):
         nullable=False,
         default=datetime.utcnow,
     )
+
+
+class OAuthState(db.Model):
+    """Temporary storage for OAuth state across cross-origin redirects."""
+
+    __tablename__ = "oauth_state"
+
+    id = db.Column(db.Integer, primary_key=True)
+    state = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    data = db.Column(db.Text, nullable=False)
+    frontend_url = db.Column(db.String(512), nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)

@@ -1332,3 +1332,42 @@ def test_invalid_oauth_session_token_fails(client):
     res = client.post("/auth/session", json={"token": "completely-invalid-token"})
     assert res.status_code == 400
     assert res.get_json()["error"] == "Invalid or expired session token"
+
+
+def test_oauth_state_persistence_without_session_cookie(app):
+    from backend.app import DatabaseStateFlaskIntegration
+    from backend.models import OAuthState
+    import json
+
+    integration = DatabaseStateFlaskIntegration("google")
+
+    with app.test_request_context("/auth/google"):
+        from flask import session
+        session["oauth_frontend_url"] = "https://trustvault-frontend-lemon.vercel.app"
+        test_state = "test-random-state-12345"
+        test_payload = {"redirect_uri": "https://trustvault-backend-hfpk.onrender.com/auth/google/callback", "nonce": "abc"}
+
+        # Store state
+        integration.set_state_data(session, test_state, test_payload)
+
+        # Check in DB
+        row = OAuthState.query.filter_by(state=test_state).first()
+        assert row is not None
+        assert row.frontend_url == "https://trustvault-frontend-lemon.vercel.app"
+        assert json.loads(row.data)["nonce"] == "abc"
+
+    # In a completely separate request with an EMPTY session (simulating dropped session cookie)
+    with app.test_request_context(f"/auth/google/callback?state={test_state}"):
+        from flask import session
+        assert dict(session) == {}
+
+        # get_state_data recovers state from DB!
+        recovered = integration.get_state_data(session, test_state)
+        assert recovered is not None
+        assert recovered["nonce"] == "abc"
+        assert recovered["redirect_uri"] == "https://trustvault-backend-hfpk.onrender.com/auth/google/callback"
+
+        # clear_state_data removes from DB
+        integration.clear_state_data(session, test_state)
+        assert OAuthState.query.filter_by(state=test_state).first() is None
+
