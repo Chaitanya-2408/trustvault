@@ -539,6 +539,10 @@ function App() {
 
   async function handleDeleteWorkspacePermanently() {
     if (!activeCompany || !workspaceDetails?.is_owner) return;
+    if (activeCompany.name.toLowerCase() === "acme global security vault") {
+      setError("The showcase workspace 'Acme Global Security Vault' is protected and cannot be deleted.");
+      return;
+    }
     const confirmName = window.prompt(`Type "${activeCompany.name}" to permanently delete this workspace and all its documents:`);
     if (confirmName !== activeCompany.name) {
       if (confirmName !== null) setError("Workspace name confirmation did not match. Deletion cancelled.");
@@ -630,7 +634,17 @@ function App() {
   }
 
   async function handleDeleteDocument() {
-    if (!selectedDoc || !window.confirm(`Delete "${selectedDoc.title}" permanently?`)) return;
+    if (!selectedDoc) return;
+    const protectedDocs = [
+      "enterprise soc-2 type ii security assessment",
+      "zero-trust tenant isolation architecture blueprint",
+      "confidential q4 2026 financial risk & tooling budget",
+    ];
+    if (protectedDocs.includes((selectedDoc.title || "").trim().toLowerCase())) {
+      setError("This showcase document is protected for evaluator presentations and cannot be deleted.");
+      return;
+    }
+    if (!window.confirm(`Delete "${selectedDoc.title}" permanently?`)) return;
     await runAction(async () => {
       await api(`/documents/${selectedDoc.id}`, { method: "DELETE", body: JSON.stringify({}) });
       setSelectedDoc(null);
@@ -694,6 +708,10 @@ function App() {
   }
 
   async function handleRemoveMember(m: Member) {
+    if (["evaluator@trustvault.local", "marcus.vance@trustvault.local", "elena.compliance@trustvault.local"].includes(m.email.toLowerCase())) {
+      setError(`Demo persona ${m.full_name || m.email} is protected and cannot be removed.`);
+      return;
+    }
     if (!window.confirm(`Remove ${m.full_name || m.email} from this workspace?`)) return;
     await runAction(async () => {
       await api(`/admin/members/${m.user_id}`, { method: "DELETE", body: JSON.stringify({}) });
@@ -1841,9 +1859,19 @@ function App() {
                         <strong>Permanently Delete Document</strong>
                         <small>Removes document record, all grants, and stored encrypted payload.</small>
                       </div>
-                      <button className="danger-button" onClick={handleDeleteDocument} disabled={busy}>
-                        Delete Document
-                      </button>
+                      {[
+                        "enterprise soc-2 type ii security assessment",
+                        "zero-trust tenant isolation architecture blueprint",
+                        "confidential q4 2026 financial risk & tooling budget"
+                      ].includes((selectedDoc.title || "").trim().toLowerCase()) ? (
+                        <span style={{ fontSize: "0.75rem", color: "var(--cyber-cyan)", padding: "0.35rem 0.65rem", background: "rgba(56, 189, 248, 0.1)", borderRadius: "6px", border: "1px solid rgba(56, 189, 248, 0.25)" }}>
+                          🔒 Protected Showcase Document
+                        </span>
+                      ) : (
+                        <button className="danger-button" onClick={handleDeleteDocument} disabled={busy}>
+                          Delete Document
+                        </button>
+                      )}
                     </div>
                   )}
                 </>
@@ -1975,13 +2003,19 @@ function App() {
                       {activeCompany.role === "admin" && (
                         <td>
                           {!m.is_owner && m.user_id !== user.id && (
-                            <button
-                              className="danger-button small"
-                              onClick={() => handleRemoveMember(m)}
-                              disabled={busy}
-                            >
-                              Remove
-                            </button>
+                            ["evaluator@trustvault.local", "marcus.vance@trustvault.local", "elena.compliance@trustvault.local"].includes(m.email.toLowerCase()) ? (
+                              <span style={{ fontSize: "0.75rem", color: "var(--cyber-cyan)", padding: "0.25rem 0.5rem", background: "rgba(56, 189, 248, 0.1)", borderRadius: "4px", border: "1px solid rgba(56, 189, 248, 0.25)" }}>
+                                🔒 Demo Persona
+                              </span>
+                            ) : (
+                              <button
+                                className="danger-button small"
+                                onClick={() => handleRemoveMember(m)}
+                                disabled={busy}
+                              >
+                                Remove
+                              </button>
+                            )
                           )}
                         </td>
                       )}
@@ -2042,17 +2076,28 @@ function App() {
                 <div>
                   <strong>Permanently Delete Workspace</strong>
                   <p className="danger-desc">
-                    This permanently deletes "{activeCompany.name}", all contained documents, and associated memberships.
-                    User accounts will remain intact.
+                    {activeCompany.name.toLowerCase() === "acme global security vault" ? (
+                      <span style={{ color: "var(--cyber-cyan)", fontWeight: 600 }}>
+                        🔒 Protected Showcase Workspace: This presentation vault is permanently protected against deletion.
+                      </span>
+                    ) : (
+                      `This permanently deletes "${activeCompany.name}", all contained documents, and associated memberships. User accounts will remain intact.`
+                    )}
                   </p>
                 </div>
-                <button
-                  className="danger-button"
-                  onClick={handleDeleteWorkspacePermanently}
-                  disabled={busy}
-                >
-                  Delete Workspace
-                </button>
+                {activeCompany.name.toLowerCase() === "acme global security vault" ? (
+                  <span style={{ fontSize: "0.75rem", color: "var(--cyber-cyan)", padding: "0.4rem 0.8rem", background: "rgba(56, 189, 248, 0.1)", borderRadius: "6px", border: "1px solid rgba(56, 189, 248, 0.25)" }}>
+                    🔒 Protected Showcase Workspace
+                  </span>
+                ) : (
+                  <button
+                    className="danger-button"
+                    onClick={handleDeleteWorkspacePermanently}
+                    disabled={busy}
+                  >
+                    Delete Workspace
+                  </button>
+                )}
               </div>
             )}
           </section>

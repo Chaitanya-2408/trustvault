@@ -45,6 +45,22 @@ from backend.models import (
 
 load_dotenv()
 
+PROTECTED_DEMO_EMAILS = {
+    "evaluator@trustvault.local",
+    "marcus.vance@trustvault.local",
+    "elena.compliance@trustvault.local",
+}
+
+PROTECTED_WORKSPACE_NAMES = {
+    "acme global security vault",
+}
+
+PROTECTED_DOC_TITLES = {
+    "enterprise soc-2 type ii security assessment",
+    "zero-trust tenant isolation architecture blueprint",
+    "confidential q4 2026 financial risk & tooling budget",
+}
+
 
 def _normalize_url(url: str, default_scheme: str = "https") -> str:
     if not url:
@@ -1200,6 +1216,9 @@ def create_app(test_config=None):
         company = db.session.get(Company, membership.company_id)
         if company and company.owner_user_id == current_user.id:
             return jsonify({"error": "The workspace owner cannot leave their own workspace. Delete the workspace or transfer ownership first."}), 403
+        if current_user.email and current_user.email.lower() in PROTECTED_DEMO_EMAILS:
+            if company and (company.normalized_name in PROTECTED_WORKSPACE_NAMES or company.name.strip().lower() in PROTECTED_WORKSPACE_NAMES):
+                return jsonify({"error": "Demo evaluator personas are protected and cannot leave the showcase workspace."}), 403
         if membership.role == "admin":
             admin_count = db.session.execute(
                 db.select(db.func.count(CompanyMembership.id)).filter_by(company_id=membership.company_id, role="admin")
@@ -1803,6 +1822,14 @@ def create_app(test_config=None):
         if document is None:
             return jsonify({"error": "Document not found"}), 404
 
+        doc_title_lower = (document.title or "").strip().lower()
+        if doc_title_lower in PROTECTED_DOC_TITLES:
+            company = db.session.get(Company, document.company_id)
+            if company and (company.normalized_name in PROTECTED_WORKSPACE_NAMES or company.name.strip().lower() in PROTECTED_WORKSPACE_NAMES):
+                return jsonify({
+                    "error": "This showcase document is protected for evaluator presentations and cannot be deleted."
+                }), 403
+
         access = get_document_access(document)
         if access != "OWNER":
             log_audit_event(
@@ -2160,6 +2187,9 @@ def create_app(test_config=None):
             return jsonify({"error": "Role must be admin, member, or viewer"}), 400
         if company and company.owner_user_id == user_id:
             return jsonify({"error": "The workspace owner's role cannot be changed"}), 403
+        target = db.session.get(User, user_id)
+        if target and target.email and target.email.lower() == "evaluator@trustvault.local" and new_role != "admin":
+            return jsonify({"error": "Demo workspace owner Alex Morgan must remain an administrator."}), 403
         target_membership = db.session.execute(
             db.select(CompanyMembership).filter_by(user_id=user_id, company_id=membership.company_id)
         ).scalar_one_or_none()
@@ -2245,6 +2275,11 @@ def create_app(test_config=None):
             return jsonify({"error": "You cannot remove your own workspace membership"}), 409
         if company and company.owner_user_id == user_id:
             return jsonify({"error": "The original company owner cannot be removed through member management"}), 403
+        target = db.session.get(User, user_id)
+        if target and target.email and target.email.lower() in PROTECTED_DEMO_EMAILS:
+            return jsonify({
+                "error": f"Demo evaluator persona '{target.full_name or target.email}' is protected and cannot be removed."
+            }), 403
         target_membership = db.session.execute(db.select(CompanyMembership).filter_by(user_id=user_id, company_id=membership.company_id)).scalar_one_or_none()
         if target_membership is None:
             return jsonify({"error": "Workspace member not found"}), 404
@@ -2273,6 +2308,12 @@ def create_app(test_config=None):
         company = db.session.get(Company, membership.company_id)
         if company is None:
             return jsonify({"error": "Company not found"}), 404
+
+        norm_name = (company.normalized_name or company.name or "").strip().lower()
+        if norm_name in PROTECTED_WORKSPACE_NAMES or "acme global security vault" in norm_name:
+            return jsonify({
+                "error": "The showcase workspace 'Acme Global Security Vault' is protected and cannot be deleted."
+            }), 403
 
         # Compatibility repair for workspaces created before explicit ownership
         # was added. Only an admin can claim a genuinely unowned workspace.
