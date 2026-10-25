@@ -291,7 +291,85 @@ def create_app(test_config=None):
     csrf.init_app(app)
     migrate.init_app(app, db)
 
+    def seed_evaluator_data(force_reset=False):
+        try:
+            evaluator = User.query.filter_by(email="evaluator@trustvault.local").first()
+            if evaluator and not force_reset:
+                return
+
+            if force_reset:
+                try:
+                    DocumentPermission.query.delete()
+                    Document.query.delete()
+                    CompanyMembership.query.delete()
+                    WorkspaceJoinRequest.query.delete()
+                    WorkspaceInvitation.query.delete()
+                    LoginOTP.query.delete()
+                    OAuthState.query.delete()
+                    AuditLog.query.delete()
+                    Company.query.delete()
+                    User.query.delete()
+                    db.session.commit()
+                except Exception:
+                    db.session.rollback()
+
+            evaluator = User.query.filter_by(email="evaluator@trustvault.local").first()
+            if not evaluator:
+                evaluator = User(full_name="Alex Morgan", email="evaluator@trustvault.local", role="admin")
+                evaluator.set_password("Password12345!")
+                db.session.add(evaluator)
+
+            collab = User.query.filter_by(email="marcus.vance@trustvault.local").first()
+            if not collab:
+                collab = User(full_name="Dr. Marcus Vance", email="marcus.vance@trustvault.local", role="viewer")
+                collab.set_password("Password12345!")
+                db.session.add(collab)
+
+            auditor = User.query.filter_by(email="elena.compliance@trustvault.local").first()
+            if not auditor:
+                auditor = User(full_name="Elena Rostova", email="elena.compliance@trustvault.local", role="viewer")
+                auditor.set_password("Password12345!")
+                db.session.add(auditor)
+
+            db.session.flush()
+
+            workspace = Company.query.filter_by(name="Acme Global Security Vault").first()
+            if not workspace:
+                workspace = Company(name="Acme Global Security Vault", owner_user_id=evaluator.id)
+                db.session.add(workspace)
+                db.session.flush()
+
+            for u, r in [(evaluator, "admin"), (collab, "member"), (auditor, "viewer")]:
+                m = CompanyMembership.query.filter_by(company_id=workspace.id, user_id=u.id).first()
+                if not m:
+                    db.session.add(CompanyMembership(company_id=workspace.id, user_id=u.id, role=r))
+
+            db.session.commit()
+
+            if Document.query.filter_by(company_id=workspace.id).count() == 0:
+                d1 = Document(company=workspace, owner=evaluator, title="Enterprise SOC-2 Type II Security Assessment", category="Compliance", description="Comprehensive architecture audit, cryptographic verification report, zero-trust workspace isolation validation, and formal penetration testing readiness.")
+                d2 = Document(company=workspace, owner=evaluator, title="Zero-Trust Tenant Isolation Architecture Blueprint", category="Technical", description="Detailed formal specification of cryptographic envelope encryption, multi-tenant database partitioning, and real-time tamper-evident auditing.")
+                d3 = Document(company=workspace, owner=evaluator, title="Confidential Q4 2026 Financial Risk & Tooling Budget", category="Financial", description="Executive procurement forecast, secure vendor key management allocations, and enterprise cyber insurance underwriting requirements.")
+                db.session.add_all([d1, d2, d3])
+                db.session.commit()
+
+            if AuditLog.query.filter_by(company_id=workspace.id).count() == 0:
+                log_audit_event("WORKSPACE_CREATED", "SUCCESS", actor_user_id=evaluator.id, actor_email=evaluator.email, company_id=workspace.id, details={"name": workspace.name})
+                log_audit_event("WORKSPACE_MEMBER_ADDED", "SUCCESS", actor_user_id=evaluator.id, actor_email=evaluator.email, target_user_id=collab.id, company_id=workspace.id, details={"role": "member", "target_email": collab.email})
+                log_audit_event("WORKSPACE_MEMBER_ADDED", "SUCCESS", actor_user_id=evaluator.id, actor_email=evaluator.email, target_user_id=auditor.id, company_id=workspace.id, details={"role": "viewer", "target_email": auditor.email})
+                log_audit_event("DOCUMENT_CREATED", "SUCCESS", actor_user_id=evaluator.id, actor_email=evaluator.email, company_id=workspace.id, details={"title": "Enterprise SOC-2 Type II Security Assessment"})
+        except Exception as e:
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+            app.logger.warning("Could not auto-seed evaluator data: %s", e)
+
     with app.app_context():
+        try:
+            db.create_all()
+        except Exception:
+            pass
         try:
             OAuthState.__table__.create(db.engine, checkfirst=True)
         except Exception:
@@ -303,6 +381,8 @@ def create_app(test_config=None):
                 conn.commit()
         except Exception:
             pass
+        if not app.config.get("TESTING"):
+            seed_evaluator_data(force_reset=False)
 
     oauth = CustomOAuth(app)
     if app.config.get("GOOGLE_CLIENT_ID") and app.config.get("GOOGLE_CLIENT_SECRET"):
@@ -358,6 +438,21 @@ def create_app(test_config=None):
     @app.get("/csrf-token")
     def csrf_token():
         return jsonify({"csrf_token": generate_csrf()}), 200
+
+    @app.route("/demo/reset-seed", methods=["GET", "POST"])
+    @csrf.exempt
+    def demo_reset_seed():
+        seed_evaluator_data(force_reset=True)
+        return jsonify({
+            "status": "ok",
+            "message": "Evaluator database has been reset and seeded with presentation credentials.",
+            "accounts": [
+                {"name": "Alex Morgan", "email": "evaluator@trustvault.local", "role": "admin"},
+                {"name": "Dr. Marcus Vance", "email": "marcus.vance@trustvault.local", "role": "member"},
+                {"name": "Elena Rostova", "email": "elena.compliance@trustvault.local", "role": "viewer"},
+            ],
+            "workspace": "Acme Global Security Vault",
+        }), 200
 
     # ---------------- Authentication ----------------
 
