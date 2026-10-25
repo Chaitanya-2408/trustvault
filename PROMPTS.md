@@ -153,3 +153,18 @@
 - Apply migrations with `python -m flask --app backend.app db upgrade`.
 - The frontend Vite proxy includes `/forgot-password` and `/reset-password`.
 - In tests only, `test_otp` is returned to allow exercising OTP flows without an SMTP server. It is never returned when `app.testing` is false.
+
+
+---
+
+### Entry 12 — Remove Presentation Reset Button and Update Documentation
+
+**Date:** 25 October 2026
+
+**Prompt:** Remove the Reset / Seed Presentation Data button from the TrustVault login screen, inspect and secure its related backend functionality, preserve protected demo accounts, and update the project documentation without committing, pushing, deploying, or executing destructive database operations.
+
+**Work completed:** Removed the "Reset / Seed Presentation Data" button and its calling handler from the login interface in `frontend/src/App.tsx`. Removed the public CSRF-exempt `/demo/reset-seed` maintenance route from `backend/app.py` and eliminated database truncation and destructive force-reset code from the backend application logic. Refactored demo data initialization into an internal, non-destructive startup helper (`ensure_demo_data`) that provisions missing demo records without modifying or deleting existing records. Added `is_demo` property checks on the `User`, `Company`, and `Document` data models in `backend/models.py`. Enforced backend authorization rules that reject attempts to remove demo accounts from the showcase workspace, demote the demo workspace owner, delete showcase documents, or permanently delete the showcase workspace with `403 Forbidden` responses. Added automated test coverage in `tests/test_app.py` verifying that `/demo/reset-seed` returns `404 Not Found` and that demo accounts, showcase documents, and the showcase workspace are protected against unauthorized deletion while standard non-demo user operations continue functioning normally. Updated `README.md`, `PROMPTS.md`, and project documentation files.
+
+**Validation:** Ran `python -m pytest -q`. Result: **53 passed in 7.95 seconds**. Ran `npm.cmd --prefix frontend run build` (`tsc -b && vite build`), which completed with zero TypeScript errors or warnings. Verified that the local SQLite database (`instance/trustvault.db`) was not modified, truncated, or reset during inspection, preserving all 3 evaluator accounts, the showcase workspace, documents, and audit logs.
+
+**Learning:** Destructive maintenance and database-reset endpoints should never be exposed over public HTTP routes or embedded into client-facing login interfaces, as any unauthenticated caller or accidental click could cause catastrophic data loss. Furthermore, demo personas and showcase workspaces must be strictly protected at the backend authorization layer using explicit model properties rather than relying solely on client-side button hiding or volatile email strings.

@@ -1555,3 +1555,93 @@ def test_duplicate_workspace_creation_is_rejected(client, app):
 
 
 
+
+
+def test_demo_reset_seed_endpoint_is_removed(client):
+    res_get = client.get("/demo/reset-seed")
+    assert res_get.status_code == 404
+    res_post = client.post("/demo/reset-seed", json={})
+    assert res_post.status_code == 404
+
+
+def test_demo_account_and_showcase_protections(app):
+    from backend.extensions import db
+    from backend.models import User, Company, CompanyMembership, Document
+
+    with app.app_context():
+        # Setup showcase entities in test database
+        evaluator = User(full_name="Alex Morgan", email="evaluator@trustvault.local", role="admin")
+        evaluator.set_password(PASSWORD)
+        marcus = User(full_name="Dr. Marcus Vance", email="marcus.vance@trustvault.local", role="viewer")
+        marcus.set_password(PASSWORD)
+        normal = User(full_name="Normal User", email="normal_test@example.com", role="viewer")
+        normal.set_password(PASSWORD)
+        db.session.add_all([evaluator, marcus, normal])
+        db.session.flush()
+
+        workspace = Company(name="Acme Global Security Vault", owner_user_id=evaluator.id)
+        db.session.add(workspace)
+        db.session.flush()
+
+        m_evaluator = CompanyMembership(company_id=workspace.id, user_id=evaluator.id, role="admin")
+        m_marcus = CompanyMembership(company_id=workspace.id, user_id=marcus.id, role="member")
+        m_normal = CompanyMembership(company_id=workspace.id, user_id=normal.id, role="member")
+        db.session.add_all([m_evaluator, m_marcus, m_normal])
+
+        doc = Document(
+            company=workspace,
+            owner=evaluator,
+            title="Enterprise SOC-2 Type II Security Assessment",
+            category="Compliance",
+            description="Showcase security assessment",
+        )
+        db.session.add(doc)
+        db.session.commit()
+
+        evaluator_id = evaluator.id
+        marcus_id = marcus.id
+        normal_id = normal.id
+        doc_id = doc.id
+        workspace_id = workspace.id
+
+    admin_client = app.test_client()
+    login(admin_client, "evaluator@trustvault.local")
+    admin_client.post("/companies/active", json={"company_id": workspace_id}, headers=csrf_headers(admin_client))
+
+    # 1. Attempt to remove protected demo persona (Dr. Marcus) -> 403
+    del_demo = admin_client.delete(f"/admin/members/{marcus_id}", headers=csrf_headers(admin_client))
+    assert del_demo.status_code == 403
+    assert "protected" in del_demo.get_json()["error"].lower()
+
+    # 2. Attempt to demote demo workspace owner Alex Morgan -> 403
+    demote_res = admin_client.patch(f"/admin/members/{evaluator_id}", json={"role": "viewer"}, headers=csrf_headers(admin_client))
+    assert demote_res.status_code == 403
+
+    # 3. Attempt to delete showcase document -> 403
+    del_doc = admin_client.delete(f"/documents/{doc_id}", headers=csrf_headers(admin_client))
+    assert del_doc.status_code == 403
+    assert "protected" in del_doc.get_json()["error"].lower()
+
+    # 4. Attempt to permanently delete showcase company -> 403
+    del_comp = admin_client.delete(
+        "/company",
+        json={"confirm_name": "Acme Global Security Vault"},
+        headers=csrf_headers(admin_client),
+    )
+    assert del_comp.status_code == 403
+    assert "protected" in del_comp.get_json()["error"].lower()
+
+    # 5. Protected demo persona cannot leave showcase workspace -> 403
+    marcus_client = app.test_client()
+    login(marcus_client, "marcus.vance@trustvault.local")
+    marcus_client.post("/companies/active", json={"company_id": workspace_id}, headers=csrf_headers(marcus_client))
+    leave_res = marcus_client.post("/company/leave", headers=csrf_headers(marcus_client))
+    assert leave_res.status_code == 403
+    assert "protected" in leave_res.get_json()["error"].lower()
+
+    # 6. Non-demo member CAN be updated and removed normally -> 200
+    update_normal = admin_client.patch(f"/admin/members/{normal_id}", json={"role": "viewer"}, headers=csrf_headers(admin_client))
+    assert update_normal.status_code == 200
+
+    del_normal = admin_client.delete(f"/admin/members/{normal_id}", headers=csrf_headers(admin_client))
+    assert del_normal.status_code == 200

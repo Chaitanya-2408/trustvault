@@ -33,6 +33,8 @@
 | Audit information leakage | Admin sees other company's events | Audit records snapshot workspace ID; query filters by selected workspace | Legacy events that cannot be unambiguously assigned during migration may have a null workspace and are not broadly exposed |
 | Denial of service | Oversized upload or excessive requests | 10 MB upload/request limit | Rate limiting, quotas and monitoring are not yet implemented |
 | Database/file inconsistency | File removed before DB commit or stale file remains | File deletion after successful DB commit; rollback cleanup on upload failure | Process crash can still leave orphan files; periodic cleanup is advisable |
+| Accidental / malicious presentation reset | Attacker or user calls a destructive reset endpoint | No destructive reset routes exist in HTTP routing; demo database seeding is restricted to non-destructive startup checks and local CLI scripts | Database write access by deployment operators could still wipe tables |
+| Showcase asset deletion | User or administrator deletes demo evaluator accounts or documents | Backend `is_demo` checks on User, Company, and Document models reject deletion attempts with 403 Forbidden | Custom non-demo assets are still subject to authorized owner deletion |
 
 ## Trust assumptions
 

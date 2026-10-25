@@ -82,13 +82,22 @@ npm run dev
 
 Open the Vite URL shown in the terminal (usually `http://localhost:5173`). Keep Flask running on `http://127.0.0.1:5000`; Vite proxies API calls to it. For a production build, run `npm run build` from `frontend/`.
 
-## Workspace flow
+## Workspace & authentication flow
 
-1. Register with `email`, `password` (minimum 12 characters), and `company_name`.
-2. Log in.
-3. Use `GET /companies` to list workspaces.
+1. Register with `full_name`, `email`, `password` (minimum 12 characters), `confirm_password`, and optional initial `company_name`.
+2. Sign in using direct database authentication with session cookies and CSRF protection.
+3. Use `GET /companies` to list workspaces the account belongs to.
 4. If the account belongs to multiple workspaces, choose one using `POST /companies/active` with `{"company_id": 123}`.
-5. Workspace-scoped document and admin routes operate only within that selected workspace.
+5. Workspace-scoped document and admin routes operate strictly within the selected workspace.
+6. Workspace administrators can manage members, update roles (`admin`, `member`, `viewer`), and search registered users.
+
+## Demo personas and showcase data protection
+
+TrustVault includes pre-configured demonstration personas (Alex Morgan, Dr. Marcus Vance, Elena Rostova) and a showcase workspace (`Acme Global Security Vault`) with sample compliance and security documents for evaluator presentations:
+
+- **Backend Protection:** The backend enforces protection rules on the `User`, `Company`, and `Document` data models. Any attempt to remove protected demo members, demote the demo owner, leave the showcase workspace, delete the showcase workspace, or delete showcase documents is rejected server-side with `403 Forbidden`.
+- **Standard Operations Intact:** Non-demo members, custom workspaces, and user-uploaded documents can be managed, updated, and deleted normally according to standard role permissions.
+- **No Public Reset Controls:** Destructive database reset is never exposed via HTTP routes or client UI. For developer maintenance in isolated test environments, developers use the standalone CLI script `python reset_and_seed_evaluators.py`.
 
 Single-workspace accounts are selected automatically for backward compatibility. Multi-workspace accounts without an active selection receive a `403` for workspace-scoped document operations until they select one.
 

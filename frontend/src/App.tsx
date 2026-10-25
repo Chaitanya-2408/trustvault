@@ -425,24 +425,10 @@ function App() {
     setAuthEmail(targetEmail);
     setAuthPassword("Password12345!");
     await runAction(async () => {
-      try {
-        await api("/login", {
-          method: "POST",
-          body: JSON.stringify({ email: targetEmail, password: "Password12345!" }),
-        });
-      } catch (err) {
-        // If the evaluator user does not exist on this environment (e.g. fresh Render database),
-        // auto-seed presentation credentials and retry login immediately.
-        try {
-          await api("/demo/reset-seed", { method: "POST" });
-          await api("/login", {
-            method: "POST",
-            body: JSON.stringify({ email: targetEmail, password: "Password12345!" }),
-          });
-        } catch {
-          throw err;
-        }
-      }
+      await api("/login", {
+        method: "POST",
+        body: JSON.stringify({ email: targetEmail, password: "Password12345!" }),
+      });
       setAuthPassword("");
       await refreshMe();
       setMessage(`Signed in as ${targetEmail}.`);
@@ -1186,32 +1172,6 @@ function App() {
                     <strong>Elena Rostova</strong>
                     <small>Auditor / Viewer</small>
                   </div>
-                </button>
-              </div>
-              <div style={{ marginTop: "0.5rem", display: "flex", justifyContent: "flex-end" }}>
-                <button
-                  type="button"
-                  style={{
-                    background: "rgba(56, 189, 248, 0.05)",
-                    border: "1px dashed rgba(56, 189, 248, 0.35)",
-                    color: "var(--cyber-cyan)",
-                    fontSize: "0.75rem",
-                    cursor: "pointer",
-                    padding: "0.3rem 0.75rem",
-                    borderRadius: "6px",
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: "0.35rem",
-                  }}
-                  onClick={async () => {
-                    await runAction(async () => {
-                      await api("/demo/reset-seed", { method: "POST" });
-                      setMessage("Presentation demo database reset & seeded with 3 evaluator personas.");
-                    });
-                  }}
-                  title="Re-seeds database to pristine state with Alex Morgan, Dr. Marcus, and Elena Rostova"
-                >
-                  🔄 Reset / Seed Presentation Data
                 </button>
               </div>
             </div>

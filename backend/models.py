@@ -34,6 +34,15 @@ class User(UserMixin, db.Model):
     def check_password(self, password):
         return bool(self.password_hash) and check_password_hash(self.password_hash, password)
 
+    @property
+    def is_demo(self):
+        return (self.email or "").strip().lower() in {
+            "evaluator@trustvault.local",
+            "marcus.vance@trustvault.local",
+            "elena.compliance@trustvault.local",
+        }
+
+
 
 class Company(db.Model):
     __tablename__ = "company"
@@ -58,6 +67,12 @@ class Company(db.Model):
     def normalize_name(self, key, value):
         self.normalized_name = " ".join((value or "").split()).casefold()
         return value
+
+    @property
+    def is_demo(self):
+        norm = (self.normalized_name or self.name or "").strip().lower()
+        return norm == "acme global security vault"
+
 
 
 class CompanyMembership(db.Model):
@@ -125,6 +140,17 @@ class Document(db.Model):
     )
     title = db.Column(db.String(255), nullable=False)
     category = db.Column(db.String(100), nullable=False, default="General")
+
+    @property
+    def is_demo(self):
+        title_lower = (self.title or "").strip().lower()
+        is_demo_title = title_lower in {
+            "enterprise soc-2 type ii security assessment",
+            "zero-trust tenant isolation architecture blueprint",
+            "confidential q4 2026 financial risk & tooling budget",
+        }
+        return is_demo_title and bool(self.company and getattr(self.company, "is_demo", False))
+
     description = db.Column(db.Text, nullable=False, default="")
     stored_filename = db.Column(
     db.String(255),

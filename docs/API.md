@@ -8,7 +8,7 @@ All request/response bodies are JSON unless the route uploads or downloads a fil
 |---|---|---|---|
 | GET | `/health` | Public | Health check |
 | GET | `/csrf-token` | Public | Gets CSRF token |
-| POST | `/register` | Public | JSON: `email`, `password`, `company_name`; creates the first workspace admin |
+| POST | `/register` | Public | JSON: `full_name`, `email`, `password`, `confirm_password`, optional `company_name`; creates account and optional first workspace admin |
 | POST | `/login` | Public | JSON: `email`, `password`; selects a workspace automatically only if the account has one |
 | POST | `/logout` | Login | Ends session |
 | GET | `/me` | Login | User metadata, workspace memberships and active workspace |
@@ -76,3 +76,13 @@ Audit responses include event ID, actor snapshot, action, outcome (`SUCCESS` or 
 - `POST /admin/join-requests/<request_id>/decision` — approve or reject a request using `{"decision":"approve"}` or `{"decision":"reject"}`.
 
 All state-changing endpoints remain subject to the application's CSRF protection. Administrator endpoints require an active workspace administrator session.
+
+
+## Protected demonstration assets
+
+To preserve presentation consistency for evaluators, specific showcase entities are protected at the API level:
+- **Demo Personas (`evaluator@trustvault.local`, `marcus.vance@trustvault.local`, `elena.compliance@trustvault.local`):** Cannot be removed from the showcase workspace (`DELETE /admin/members/<id>` returns `403`), demoted from administrator role, or left via `POST /company/leave`.
+- **Showcase Workspace (`Acme Global Security Vault`):** Cannot be permanently deleted (`DELETE /company` returns `403`).
+- **Showcase Documents:** Core demonstration documents cannot be deleted via `DELETE /documents/<id>` (`403 Forbidden`).
+- **Standard Operations:** Eligible non-demo members, custom workspaces, and user documents can be created, updated, and deleted normally.
+- **No Public Reset Endpoint:** Database-wide reset is prohibited via web endpoints. Staging/developer seeding is maintained via local CLI scripts only.

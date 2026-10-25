@@ -307,27 +307,11 @@ def create_app(test_config=None):
     csrf.init_app(app)
     migrate.init_app(app, db)
 
-    def seed_evaluator_data(force_reset=False):
+    def ensure_demo_data():
         try:
             evaluator = User.query.filter_by(email="evaluator@trustvault.local").first()
-            if evaluator and not force_reset:
+            if evaluator:
                 return
-
-            if force_reset:
-                try:
-                    DocumentPermission.query.delete()
-                    Document.query.delete()
-                    CompanyMembership.query.delete()
-                    WorkspaceJoinRequest.query.delete()
-                    WorkspaceInvitation.query.delete()
-                    LoginOTP.query.delete()
-                    OAuthState.query.delete()
-                    AuditLog.query.delete()
-                    Company.query.delete()
-                    User.query.delete()
-                    db.session.commit()
-                except Exception:
-                    db.session.rollback()
 
             evaluator = User.query.filter_by(email="evaluator@trustvault.local").first()
             if not evaluator:
@@ -398,7 +382,7 @@ def create_app(test_config=None):
         except Exception:
             pass
         if not app.config.get("TESTING"):
-            seed_evaluator_data(force_reset=False)
+            ensure_demo_data()
 
     oauth = CustomOAuth(app)
     if app.config.get("GOOGLE_CLIENT_ID") and app.config.get("GOOGLE_CLIENT_SECRET"):
@@ -455,20 +439,6 @@ def create_app(test_config=None):
     def csrf_token():
         return jsonify({"csrf_token": generate_csrf()}), 200
 
-    @app.route("/demo/reset-seed", methods=["GET", "POST"])
-    @csrf.exempt
-    def demo_reset_seed():
-        seed_evaluator_data(force_reset=True)
-        return jsonify({
-            "status": "ok",
-            "message": "Evaluator database has been reset and seeded with presentation credentials.",
-            "accounts": [
-                {"name": "Alex Morgan", "email": "evaluator@trustvault.local", "role": "admin"},
-                {"name": "Dr. Marcus Vance", "email": "marcus.vance@trustvault.local", "role": "member"},
-                {"name": "Elena Rostova", "email": "elena.compliance@trustvault.local", "role": "viewer"},
-            ],
-            "workspace": "Acme Global Security Vault",
-        }), 200
 
     # ---------------- Authentication ----------------
 
@@ -1823,9 +1793,9 @@ def create_app(test_config=None):
             return jsonify({"error": "Document not found"}), 404
 
         doc_title_lower = (document.title or "").strip().lower()
-        if doc_title_lower in PROTECTED_DOC_TITLES:
+        if getattr(document, "is_demo", False) or doc_title_lower in PROTECTED_DOC_TITLES:
             company = db.session.get(Company, document.company_id)
-            if company and (company.normalized_name in PROTECTED_WORKSPACE_NAMES or company.name.strip().lower() in PROTECTED_WORKSPACE_NAMES):
+            if company and (getattr(company, "is_demo", False) or company.normalized_name in PROTECTED_WORKSPACE_NAMES or company.name.strip().lower() in PROTECTED_WORKSPACE_NAMES):
                 return jsonify({
                     "error": "This showcase document is protected for evaluator presentations and cannot be deleted."
                 }), 403
@@ -2276,7 +2246,7 @@ def create_app(test_config=None):
         if company and company.owner_user_id == user_id:
             return jsonify({"error": "The original company owner cannot be removed through member management"}), 403
         target = db.session.get(User, user_id)
-        if target and target.email and target.email.lower() in PROTECTED_DEMO_EMAILS:
+        if target and (getattr(target, "is_demo", False) or (target.email and target.email.lower() in PROTECTED_DEMO_EMAILS)):
             return jsonify({
                 "error": f"Demo evaluator persona '{target.full_name or target.email}' is protected and cannot be removed."
             }), 403
@@ -2310,7 +2280,7 @@ def create_app(test_config=None):
             return jsonify({"error": "Company not found"}), 404
 
         norm_name = (company.normalized_name or company.name or "").strip().lower()
-        if norm_name in PROTECTED_WORKSPACE_NAMES or "acme global security vault" in norm_name:
+        if getattr(company, "is_demo", False) or norm_name in PROTECTED_WORKSPACE_NAMES or "acme global security vault" in norm_name:
             return jsonify({
                 "error": "The showcase workspace 'Acme Global Security Vault' is protected and cannot be deleted."
             }), 403
